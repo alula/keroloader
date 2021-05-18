@@ -1,0 +1,50 @@
+
+# Created by https://www.toptal.com/developers/gitignore/api/idapro,cmake
+# Edit at https://www.toptal.com/developers/gitignore?templates=idapro,cmake
+
+### CMake ###
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
+CMakeUserPresets.json
+
+### CMake Patch ###
+# External projects
+*-prefix/
+
+### IDAPro ###
+# gitginore template for IDA Pro
+# website: https://www.hex-rays.com/index.shtml
+
+# IDA Pro Runtime temporary file
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# IDA Pro 64 packaged data
+*.i64
+# IDA Pro 32 packaged data
+*.idb
+
+# End of https://www.toptal.com/developers/gitignore/api/idapro,cmake
+
+*.dxvk-cache
+*.log
+
+*.exe
+*.dll
+rsc_k
+rsc_p
+build
+
+.vscode
