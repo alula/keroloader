@@ -105,9 +105,8 @@ uint32_t jit_base = 0xd0000000;
 
 class ThreadCtx;
 
-static std::vector<void (*)(uc_engine *uc, uint32_t esp)> thunk_cbs;
+std::vector<void (*)(uc_engine *uc, uint32_t esp)> thunk_cbs;
 static std::vector<ThreadCtx *> threads;
-static std::unordered_map<std::string, uint32_t> import_cache;
 static uint32_t tid_counter = 1;
 bool emu_failed = false;
 
@@ -123,7 +122,10 @@ uint32_t jit_size = 0;
 uint32_t emu_spinlock_thunk = 0;
 uint32_t emu_spinlock_lock = 0xf0000ff8;
 
+std::unordered_map<std::string, uint32_t> import_cache;
 static std::string export_log = "";
+
+uint32_t last_error = 0;
 
 /*
 emu_spinlock:
@@ -137,82 +139,82 @@ static uint8_t emu_spinlock_code[] = {0xA1, 0xF8, 0x0F, 0x00, 0xF0, 0x85, 0xC0, 
 
 peparse::parsed_pe *pe = nullptr;
 
-class ThreadCtx
+ThreadCtx::ThreadCtx()
 {
-public:
-    uint32_t thread_id = 0;
-    uint32_t eax = 0;
-    uint32_t ebx = 0;
-    uint32_t ecx = 0;
-    uint32_t edx = 0;
-    uint32_t esi = 0;
-    uint32_t edi = 0;
-    uint32_t eip = 0;
-    uint32_t esp = 0;
-    uint32_t ebp = 0;
-    uint32_t eflags = 0;
-    void *stack = nullptr;
-    void *teb = nullptr;
+    thread_id = tid_counter++;
+    stack = malloc(stack_size);
+    stack_end = (void *)((char *)stack + stack_size);
+    teb = malloc(0x2000);
+    logf("Thread %u: Allocated %u bytes of stack.\n", thread_id, stack_size);
+}
 
-    ThreadCtx()
+ThreadCtx::~ThreadCtx()
+{
+    if (stack != nullptr)
     {
-        thread_id = tid_counter++;
-        stack = malloc(stack_size);
-        teb = malloc(0x2000);
-        logf("Thread %u: Allocated %u bytes of stack.\n", thread_id, stack_size);
+        logf("Thread %u: Freed thread's stack.\n", thread_id, stack_size);
+        free(stack);
+        stack = nullptr;
+        stack_end = nullptr;
     }
 
-    ~ThreadCtx()
+    if (teb != nullptr)
     {
-        if (stack != nullptr)
-        {
-            logf("Thread %u: Freed thread's stack.\n", thread_id, stack_size);
-            free(stack);
-            stack = nullptr;
-        }
-
-        if (teb != nullptr)
-        {
-            free(teb);
-            teb = nullptr;
-        }
+        free(teb);
+        teb = nullptr;
     }
+}
 
-    void save_regs(uc_engine *uc)
+void ThreadCtx::save_regs(uc_engine *uc)
+{
+    uc_assert(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_EBX, &ebx));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_EDX, &edx));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_ESI, &esi));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_EDI, &edi));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_EBP, &ebp));
+    uc_assert(uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags));
+}
+
+void ThreadCtx::restore_regs(uc_engine *uc)
+{
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ECX, &ecx));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EDX, &edx));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESI, &esi));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EDI, &edi));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &eip));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EBP, &ebp));
+    // uc_assert(uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags));
+}
+
+void ThreadCtx::print_stack(uc_engine *uc)
+{
+    logf("Thread %u stack dump:\n", thread_id);
+    uint32_t sp;
+    uc_assert(uc_reg_read(uc, UC_X86_REG_ESP, &sp));
+    uint32_t *stk = (uint32_t *)stack;
+    sp -= 20;
+    uint32_t start = (sp - stack_base) / 4;
+    uint32_t len = (stack_base + stack_size - sp) / 4;
+
+    for (int i = 0; i < len; i++)
     {
-        uc_assert(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_EBX, &ebx));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_EDX, &edx));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_ESI, &esi));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_EDI, &edi));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_ESP, &esp));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_EBP, &ebp));
-        uc_assert(uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags));
+        logf("%#010x: %#010x\n", stack_base + (start + i) * 4, stk[start + i]);
     }
+}
 
-    void restore_regs(uc_engine *uc)
-    {
-        uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_ECX, &ecx));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_EDX, &edx));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_ESI, &esi));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_EDI, &edi));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &eip));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
-        uc_assert(uc_reg_write(uc, UC_X86_REG_EBP, &ebp));
-        // uc_assert(uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags));
-    }
-
-    void print_regs()
-    {
-        logf("Thread %u register dump:\n", thread_id);
-        logf("eax=%#010x ebx=%#010x ecx=%#010x edx=%#010x esi=%#010x edi=%#010x\n", eax, ebx, ecx, edx, esi, edi);
-        logf("eip=%#010x esp=%#010x ebp=%#010x eflags=%#010x \n", eip, esp, ebp, eflags);
-    }
-};
+void ThreadCtx::print_regs()
+{
+    logf("Thread %u register dump:\n", thread_id);
+    logf("eax=%#010x ebx=%#010x ecx=%#010x edx=%#010x esi=%#010x edi=%#010x\n", eax, ebx, ecx, edx, esi, edi);
+    logf("eip=%#010x esp=%#010x ebp=%#010x eflags=%#010x \n", eip, esp, ebp, eflags);
+}
 
 static constexpr const char *reloc_name(const peparse::reloc_type reloc_type)
 {
@@ -385,6 +387,13 @@ peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
             {
                 logf("Export: %s!%s -> %#010lx\n", mod_name.c_str(), sym_name.c_str(), export_addr);
                 import_cache[sym_name] = (uint32_t)export_addr;
+
+                if (exports.find(sym_name) == exports.end())
+                {
+                    Export ex = {sym_name, nullptr, nullptr, 0, export_addr};
+                    exports[sym_name] = ex;
+                    exports["_" + sym_name] = ex;
+                }
             }
 
             return 0;
@@ -452,6 +461,7 @@ static bool hook_segfault(uc_engine *uc, uc_mem_type type,
     thread->save_regs(uc);
 
     logf("Access Violation at %#010x [addr=%#010lx, size=%#010x, value=%#010lx]\n", thread->eip, address, size, value);
+    thread->print_stack(uc);
     //thread->print_regs();
 
     uc_emu_stop(uc);
@@ -617,7 +627,7 @@ int emu_init()
         // write DllEntryPoint params
         uc_assert(uc_mem_write(uc, main_thread->esp + 4, &curr_module_handle, 4)); // hInst
         param = 1;
-        uc_assert(uc_mem_write(uc, main_thread->esp + 8, &param, 4)); // dwReason = DLL_PROCESS_ATTACH
+        uc_assert(uc_mem_write(uc, main_thread->esp + 8, &param, 4));  // dwReason = DLL_PROCESS_ATTACH
         uc_assert(uc_mem_write(uc, main_thread->esp + 12, &param, 4)); // lpReserved, must be non-zero otherwise msvcrt will call some termination procedure
 
         logf("TEB setup\n");
@@ -674,7 +684,7 @@ int emu_init()
 
         uc_assert(uc_hook_add(uc, &segfault, UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, (void *)hook_segfault, main_thread, 1, 0), "Failed to register segfault hook");
         uc_assert(uc_hook_add(uc, &interrupt, UC_HOOK_INTR, (void *)hook_interrupt, main_thread, 1, 0), "Failed to register interrupt hook");
-        uc_assert(uc_hook_add(uc, &trace, UC_HOOK_CODE, (void *)hook_trace, main_thread, image_base, 0x20000000), "Failed to register trace hook");
+        uc_assert(uc_hook_add(uc, &trace, UC_HOOK_CODE, (void *)hook_trace, main_thread, image_base, 0x80000000), "Failed to register trace hook");
     }
     catch (std::exception &e)
     {

@@ -7,7 +7,22 @@
 
 static void cb_user32_SetWindowsHookExW(uc_engine *uc, uint32_t esp)
 {
+    uint32_t return_addr;
+    uint32_t hook_type;
+    uint32_t callback;
+    uint32_t module_handle;
+    uint32_t thread_id;
+    uint32_t ret = 0x1400;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &hook_type, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &callback, 4));
+    uc_assert(uc_mem_read(uc, esp + 12, &module_handle, 4));
+    uc_assert(uc_mem_read(uc, esp + 16, &thread_id, 4));
 
+    esp += 20;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
 static void cb_user32_MessageBoxA(uc_engine *uc, uint32_t esp)
@@ -49,6 +64,9 @@ static void cb_user32_MessageBoxA(uc_engine *uc, uint32_t esp)
 
 void install_user32_exports(uc_engine *uc)
 {
+    Export SetWindowsHookExW_ex = {"SetWindowsHookExW", cb_user32_SetWindowsHookExW};
+    exports["SetWindowsHookExW"] = SetWindowsHookExW_ex;
+
     Export MessageBoxA_ex = {"MessageBoxA", cb_user32_MessageBoxA};
     exports["MessageBoxA"] = MessageBoxA_ex;
 }

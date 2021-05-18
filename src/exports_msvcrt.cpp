@@ -269,9 +269,9 @@ void install_msvcrt_exports(uc_engine *uc)
     uc_assert(uc_mem_write(uc, msvcrt_env + 0x10, &fake_argv, sizeof(fake_argv)));
     uc_assert(uc_mem_write(uc, msvcrt_env + 0x50, &fake_envp, sizeof(fake_envp)));
 
-    logf("Initializing memory allocator...\n");
-    auto heap_end = (void *)((char *)heap + heap_size);
-    ta_init(heap, heap_end, 1024 * 32, 16, 4);
+    //logf("Initializing memory allocator...\n");
+    //auto heap_end = (void *)((char *)heap + heap_size);
+    //tinyalloc::ta_init(&, heap, heap_end, 1024 * 32, 16, 4);
 
     Export __getmainargs_ex = {"__getmainargs", nullptr, code_msvcrt_getmainargs, sizeof(code_msvcrt_getmainargs)};
     exports["__getmainargs"] = __getmainargs_ex;

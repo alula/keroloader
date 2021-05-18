@@ -1,4 +1,6 @@
 #include <cstdlib>
+#include <clocale>
+#include <locale>
 
 #include "sokol/imconfig.h"
 #include "sokol/imgui.h"
@@ -64,7 +66,7 @@ void frame(void)
         }
 
         auto io = ImGui::GetIO();
-        ImGui::SetNextWindowSizeConstraints(ImVec2(250.0f, 80.0f), ImVec2(400.0f, 200.0f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(250.0f, 80.0f), ImVec2(700.0f, 200.0f));
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x / 2.f, io.DisplaySize.y / 2.f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         ImGui::Begin(msgbox_title_txt, nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
         ImGui::TextWrapped("%s", msgbox_message_txt);
@@ -97,6 +99,10 @@ sapp_desc sokol_main(int argc, char *argv[])
 {
     (void)argc;
     (void)argv;
+
+    setlocale(LC_ALL, "C");
+    std::locale::global(std::locale("C"));
+
     sapp_desc desc = {};
     desc.init_cb = init;
     desc.frame_cb = frame;
