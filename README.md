@@ -12,5 +12,5 @@ KeroLoader is perfectly legal to use if you own a copy of the game on Steam (the
 - KeroLoader uses a completely clean-room Win32 implementation, not based on anything but public domain MinGW headers and Microsoft's API documentation.
 
 ### Needed files
-- `KeroBlaster.exe` and data (`rsc_k` folder) acquired from Steam (the Playism release might possibly work as well but it was never tested).
+- `KeroBlaster.exe` and data (`rsc_k` folder) acquired from Steam build (the Playism release might possibly work as well but it was never tested).
 - 32-bit `msvcrt.dll` or `msvcr100.dll` (aka Windows builtin CRT or Visual Studio 2010 C runtime).
