@@ -300,7 +300,7 @@ uint32_t add_syscall(uc_engine *uc, uint32_t id, void (*cb)(uc_engine *, uint32_
 
     memset(thunk, 0xcc, sizeof(thunk));
     thunk[0] = 0x68; // push id
-    *((uint32_t *)&thunk[1]) = id;
+    memcpy(&thunk[1], &id, 4);
     thunk[5] = 0xcd; // int 0x55
     thunk[6] = 0x55;
 
@@ -496,8 +496,8 @@ static bool hook_interrupt(uc_engine *uc, uint32_t int_num, void *user_data)
     case 0x10: // fp exception
         logf("Floating point exception\n");
         return false;
-    case 0x55:
-    { // emulator function call
+    case 0x55: // emulator function call
+    {
         uint32_t esp;
         uint32_t call_id;
 
