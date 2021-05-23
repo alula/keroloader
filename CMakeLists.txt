@@ -19,9 +19,13 @@ add_executable(keroloader2
     src/gstw_table.cpp
     src/exports.cpp
     src/exports_comctl32.cpp
+    src/exports_d3d9.cpp
+    src/exports_dsound.cpp
     src/exports_kernel32.cpp
     src/exports_user32.cpp
+    src/exports_msvcrt.cpp
     src/exports_winmm.cpp
+    src/exports_steam_api.cpp
     src/exports_shlwapi.cpp
     src/pe-parse/buffer.cpp
     src/pe-parse/parse.cpp
