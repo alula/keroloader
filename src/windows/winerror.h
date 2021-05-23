@@ -1963,15 +1963,15 @@
 #define SEVERITY_ERROR 1
 #define SUCCEEDED(hr) ((HRESULT)(hr) >= 0)
 #define FAILED(hr) ((HRESULT)(hr) < 0)
-#define IS_ERROR(Status) ((unsigned __LONG32)(Status) >> 31==SEVERITY_ERROR)
+#define IS_ERROR(Status) ((unsigned int)(Status) >> 31==SEVERITY_ERROR)
 #define HRESULT_CODE(hr) ((hr) & 0xFFFF)
 #define SCODE_CODE(sc) ((sc) & 0xFFFF)
 #define HRESULT_FACILITY(hr) (((hr) >> 16) & 0x1fff)
 #define SCODE_FACILITY(sc) (((sc) >> 16) & 0x1fff)
 #define HRESULT_SEVERITY(hr) (((hr) >> 31) & 0x1)
 #define SCODE_SEVERITY(sc) (((sc) >> 31) & 0x1)
-#define MAKE_HRESULT(sev,fac,code) ((HRESULT) (((unsigned __LONG32)(sev)<<31) | ((unsigned __LONG32)(fac)<<16) | ((unsigned __LONG32)(code))))
-#define MAKE_SCODE(sev,fac,code) ((SCODE) (((unsigned __LONG32)(sev)<<31) | ((unsigned __LONG32)(fac)<<16) | ((unsigned __LONG32)(code))))
+#define MAKE_HRESULT(sev,fac,code) ((HRESULT) (((unsigned int)(sev)<<31) | ((unsigned int)(fac)<<16) | ((unsigned int)(code))))
+#define MAKE_SCODE(sev,fac,code) ((SCODE) (((unsigned int)(sev)<<31) | ((unsigned int)(fac)<<16) | ((unsigned int)(code))))
 #define FACILITY_NT_BIT 0x10000000
 #define __HRESULT_FROM_WIN32(x) ((HRESULT)(x) <= 0 ? ((HRESULT)(x)) : ((HRESULT) (((x) & 0x0000FFFF) | (FACILITY_WIN32 << 16) | 0x80000000)))
 #ifdef INLINE_HRESULT_FROM_WIN32

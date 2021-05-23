@@ -2,41 +2,49 @@
 #include <clocale>
 #include <locale>
 
-#include "sokol/imconfig.h"
-#include "sokol/imgui.h"
-
-#include "sokol/sokol_app.h"
-#include "sokol/sokol_gfx.h"
-#include "sokol/sokol_time.h"
-#include "sokol/sokol_glue.h"
-#include "sokol/sokol_imgui.h"
+#include "sokol_pipeline.h"
 
 static uint64_t last_time = 0;
 static bool show_test_window = true;
 static bool show_another_window = false;
 
 static sg_pass_action pass_action;
+sokol_state state;
 
 extern void emu_loop();
 extern int emu_init();
 extern void logf(const char *fmt, ...);
 
+int window_width = 0;
+int window_height = 0;
 char msgbox_title_txt[2048] = {0};
 char msgbox_message_txt[4096] = {0};
 
 void init(void)
 {
     sg_desc desc = {};
+    sgl_desc_t sgl_desc = {};
     simgui_desc_t simgui_desc = {};
 
     desc.context = sapp_sgcontext();
     sg_setup(&desc);
+    sgl_setup(&sgl_desc);
     stm_setup();
 
     simgui_setup(&simgui_desc);
 
     pass_action.colors[0].action = SG_ACTION_CLEAR;
     pass_action.colors[0].value = {0.0f, 0.0f, 0.0f, 1.0f};
+
+    state.deflt.pass_action = pass_action;
+    sg_pipeline_desc pdesc = {
+        .depth = {
+            .compare = SG_COMPAREFUNC_LESS_EQUAL,
+            .write_enabled = true,
+        },
+        .cull_mode = SG_CULLMODE_BACK,
+    };
+    state.deflt.pip = sgl_make_pipeline(&pdesc);
 
     ImGui::GetIO().IniFilename = nullptr;
 
@@ -47,16 +55,22 @@ void init(void)
     }
 }
 
+extern void test_draw();
+
 void frame(void)
 {
     const int width = sapp_width();
     const int height = sapp_height();
     const double delta_time = stm_sec(stm_laptime(&last_time));
 
-    //logf("emu loop %s %s\n", msgbox_message_txt, msgbox_title_txt);
-    emu_loop();
-
     simgui_new_frame(width, height, delta_time);
+    sg_begin_default_pass(&pass_action, width, height);
+
+    //logf("emu loop %s %s\n", msgbox_message_txt, msgbox_title_txt);
+    sgl_defaults();
+    sgl_load_pipeline(state.deflt.pip);
+    emu_loop();
+    sgl_draw();
 
     if (msgbox_message_txt[0])
     {
@@ -78,7 +92,7 @@ void frame(void)
         ImGui::End();
     }
 
-    sg_begin_default_pass(&pass_action, width, height);
+    test_draw();
     simgui_render();
     sg_end_pass();
     sg_commit();
@@ -113,6 +127,6 @@ sapp_desc sokol_main(int argc, char *argv[])
     desc.gl_force_gles2 = true;
     desc.window_title = "KeroLoader";
     desc.ios_keyboard_resizes_canvas = false;
-    desc.icon.sokol_default = true;
+    desc.icon.sokol_default = false;
     return desc;
 }

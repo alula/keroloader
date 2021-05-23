@@ -100,40 +100,95 @@ std::unordered_map<uint32_t, uint32_t> fiber_callbacks;
 // {critical section handle -> owning thread}
 std::unordered_map<uint32_t, uint32_t> crit_sections;
 
+std::unordered_map<uint32_t, FILE *> file_handles;
+
 struct FindFileData
 {
     std::filesystem::directory_iterator iter;
     std::string pattern;
     uint32_t flags = 0;
+    bool ended = false;
 
-    bool next_wide(uc_engine *uc, uint32_t find_file_data_w_addr)
+    bool next(uc_engine *uc, bool wide, uint32_t find_file_data_addr)
     {
         int fnflags = FNM_PATHNAME;
         if ((flags & 1) != 0)
             fnflags |= FNM_CASEFOLD;
 
-        for (;;)
+        if (ended)
         {
-            try
-            {
-                auto file = *iter;
-                printf("%s %s -> ", pattern.c_str(), file.path().filename().c_str());
-                std::error_code err;
-                iter.increment(err);
+            last_error = ERROR_NO_MORE_FILES;
+            return false;
+        }
 
-                if (fnmatch(pattern.c_str(), file.path().filename().c_str(), fnflags) == 0)
-                {
-                    printf("matched!\n");
-                    return true;
-                }
-                else
-                {
-                    printf("unmatched\n");
-                }
-            }
-            catch (std::out_of_range)
+        if (iter == std::filesystem::end(iter))
+        {
+            last_error = ERROR_NO_MORE_FILES;
+            ended = true;
+        }
+
+        while (!ended)
+        {
+            auto file = *iter;
+            auto filename = file.path().filename();
+            // printf("%s %s -> ", pattern.c_str(), filename.c_str());
+            std::error_code err;
+            iter.increment(err);
+
+            if (err || iter == std::filesystem::end(iter))
             {
-                break;
+                // printf("end?\n");
+                last_error = ERROR_NO_MORE_FILES;
+                ended = true;
+            }
+
+            if (fnmatch(pattern.c_str(), filename.c_str(), fnflags) == 0)
+            {
+                if (find_file_data_addr != 0)
+                {
+                    unsigned int flags = 0;
+                    if (file.is_block_file())
+                        flags |= 0x40;
+                    if (file.is_character_file())
+                        flags |= 0x40;
+                    if (file.is_directory())
+                        flags |= 0x10;
+                    if (filename.c_str()[0] == '.')
+                        flags |= 0x02;
+                    if (flags == 0)
+                        flags |= 0x80;
+                    unsigned int zero = 0;
+
+                    uc_assert(uc_mem_write(uc, find_file_data_addr, &flags, 4));    // attribs
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 4, &zero, 4)); // creation time
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 8, &zero, 4));
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 12, &zero, 4)); // last access time
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 16, &zero, 4));
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 20, &zero, 4)); // last write time
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 24, &zero, 4));
+                    uint64_t size = file.file_size();
+                    uint32_t size_hi = size >> 32;
+                    uint32_t size_lo = size & 0xffffffff;
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 28, &size_hi, 4));
+                    uc_assert(uc_mem_write(uc, find_file_data_addr + 32, &size_lo, 4));
+                    // 8 reserved
+
+                    if (wide)
+                    {
+                        uc_assert(uc_mem_write(uc, find_file_data_addr + 40, filename.generic_u16string().data(), 2 * filename.generic_u16string().size()));
+                    }
+                    else
+                    {
+                        uc_assert(uc_mem_write(uc, find_file_data_addr + 40, filename.generic_string().data(), filename.generic_string().size()));
+                    }
+                }
+
+                // printf("matched!\n");
+                return true;
+            }
+            else
+            {
+                // printf("unmatched\n");
             }
         }
         return false;
@@ -156,6 +211,34 @@ void set_last_error(std::error_code const &err)
     }
 }
 
+void set_last_error(int err)
+{
+    if (err == EPERM)
+    {
+        last_error = ERROR_ACCESS_DENIED;
+    }
+    else if (err == EEXIST)
+    {
+        last_error = ERROR_ALREADY_EXISTS;
+    }
+    else if (err == ENOENT)
+    {
+        last_error = ERROR_PATH_NOT_FOUND;
+    }
+    else if (err == ENOSPC)
+    {
+        last_error == ERROR_DISK_FULL;
+    }
+    else if (err == EOVERFLOW)
+    {
+        last_error = ERROR_NEGATIVE_SEEK;
+    }
+    else
+    {
+        last_error = ERROR_ACCESS_DENIED;
+    }
+}
+
 std::unordered_map<uint32_t, FindFileData> find_file_handles;
 
 extern uint16_t gstw_ct1_table[0x10000];
@@ -163,6 +246,74 @@ extern uint16_t gstw_ct2_table[0x10000];
 extern uint16_t gstw_ct3_table[0x10000];
 
 static tinyalloc::HeapAllocator allocator;
+
+void *kernel32_host_malloc(uintptr_t *emu_addr, size_t size)
+{
+    void *mem = tinyalloc::ta_alloc(&allocator, size);
+
+    if (emu_addr != nullptr)
+    {
+        *emu_addr = uintptr_t(mem) - uintptr_t(heap) + heap_base;
+    }
+
+    return mem;
+}
+
+void kernel32_host_free(void *mem)
+{
+    tinyalloc::ta_free(&allocator, mem);
+}
+
+static void cb_kernel32_FindFirstFileA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t lp_filename;
+    uint32_t lp_find_file_data;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &lp_filename, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &lp_find_file_data, 4));
+
+    if (lp_filename != 0)
+    {
+        auto path = to_unix_path(to_u16string(read_string(uc, lp_filename)));
+        auto split = split_unix_path(path);
+        FindFileData f;
+        std::error_code err;
+        f.iter = std::filesystem::directory_iterator(split.first, err);
+        f.pattern = split.second;
+
+        if (!err)
+        {
+            for (uint32_t i = 0x9000; i < 0xffff; i++)
+            {
+                if (find_file_handles.find(i) == find_file_handles.end())
+                {
+                    if (f.next(uc, false, lp_find_file_data))
+                    {
+                        ret = i;
+                        find_file_handles[i] = f;
+                    }
+                    else
+                    {
+                        ret = 0;
+                    }
+                    break;
+                }
+            }
+        }
+        else
+        {
+            set_last_error(err);
+            ret = 0;
+        }
+    }
+
+    esp += 12;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
 
 static void cb_kernel32_FindFirstFileW(uc_engine *uc, uint32_t esp)
 {
@@ -184,15 +335,13 @@ static void cb_kernel32_FindFirstFileW(uc_engine *uc, uint32_t esp)
         f.pattern = split.second;
         // f.flags = dw_additional_flags;
 
-        printf("%s %s\n", path.c_str(), split.first.c_str(), split.second.c_str());
-
         if (!err)
         {
             for (uint32_t i = 0x9000; i < 0xffff; i++)
             {
                 if (find_file_handles.find(i) == find_file_handles.end())
                 {
-                    if (f.next_wide(uc, lp_find_file_data))
+                    if (f.next(uc, true, lp_find_file_data))
                     {
                         ret = i;
                         find_file_handles[i] = f;
@@ -212,7 +361,338 @@ static void cb_kernel32_FindFirstFileW(uc_engine *uc, uint32_t esp)
         }
     }
 
-    for(;;);
+    esp += 12;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_FindNextFileA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t handle;
+    uint32_t lp_find_file_data;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &handle, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &lp_find_file_data, 4));
+
+    auto f = find_file_handles.find(handle);
+    if (f != find_file_handles.end())
+    {
+        ret = (int)f->second.next(uc, false, lp_find_file_data);
+    }
+    else
+    {
+        last_error = ERROR_INVALID_HANDLE;
+    }
+
+    esp += 12;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_FindNextFileW(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t handle;
+    uint32_t lp_find_file_data;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &handle, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &lp_find_file_data, 4));
+
+    auto f = find_file_handles.find(handle);
+    if (f != find_file_handles.end())
+    {
+        ret = (int)f->second.next(uc, true, lp_find_file_data);
+    }
+    else
+    {
+        last_error = ERROR_INVALID_HANDLE;
+    }
+
+    esp += 12;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_FindClose(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t handle;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &handle, 4));
+
+    auto f = find_file_handles.find(handle);
+    if (f != find_file_handles.end())
+    {
+        find_file_handles.erase(f);
+    }
+    else
+    {
+        last_error = ERROR_INVALID_HANDLE;
+    }
+
+    esp += 8;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CloseHandle(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t handle;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &handle, 4));
+
+    auto f = file_handles.find(handle);
+    if (f != file_handles.end())
+    {
+        fclose(f->second);
+        file_handles.erase(f);
+        ret = 1;
+    }
+
+    if (ret == 0)
+    {
+        last_error = ERROR_INVALID_HANDLE;
+    }
+
+    esp += 8;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateFileA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t path_buf;
+    uint32_t dw_desired_access;
+    uint32_t dw_creation_disposition;
+    uint32_t dw_flags;
+    uint32_t ret = INVALID_HANDLE_VALUE;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &path_buf, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &dw_desired_access, 4));
+    // ignore share mode 12
+    // ignore security attrib 16
+    uc_assert(uc_mem_read(uc, esp + 20, &dw_creation_disposition, 4));
+    uc_assert(uc_mem_read(uc, esp + 24, &dw_flags, 4));
+    // ignore htemplate 28
+
+    if (path_buf != 0)
+    {
+        const auto u16path = to_u16string(read_string(uc, path_buf));
+        if (u16path == u"CONIN$")
+        {
+            ret = STDIN_HANDLE_VALUE;
+        }
+        else if (u16path == u"CONOUT$")
+        {
+            ret = STDOUT_HANDLE_VALUE;
+        }
+        else
+        {
+            const auto path = to_unix_path(u16path);
+            FILE *handle = nullptr;
+
+            logf("CreateFileA(%s, %#010x, %#010x)\n", path.c_str(), dw_desired_access, dw_creation_disposition);
+
+            if (dw_desired_access == 0xc0000000 && dw_creation_disposition == 4)
+            {
+                handle = fopen64(path.c_str(), "r+b");
+                if (handle == nullptr && errno == ENOENT)
+                {
+                    handle = fopen64(path.c_str(), "w+b");
+                }
+
+                if (handle != nullptr)
+                    fseek(handle, 0, SEEK_SET);
+            }
+            else if (dw_desired_access == 0x80000000 && dw_creation_disposition == 3)
+            {
+                handle = fopen64(path.c_str(), "rb");
+
+                if (handle != nullptr)
+                    fseek(handle, 0, SEEK_SET);
+            }
+            else if (dw_desired_access == 0x40000000 && dw_creation_disposition == 2)
+            {
+                handle = fopen64(path.c_str(), "w+b");
+
+                if (handle != nullptr)
+                    fseek(handle, 0, SEEK_SET);
+            }
+            else
+            {
+                logf("Unknown access type.\n");
+                for (;;)
+                    ;
+            }
+
+            if (handle == nullptr)
+            {
+                set_last_error(errno);
+                printf("errno: %d %#010x\n", errno, last_error);
+            }
+            else
+            {
+                for (uint32_t i = FILE_HANDLE_VALUE_OFFSET; i < (FILE_HANDLE_VALUE_OFFSET + 0xfffff); i++)
+                {
+                    if (file_handles.find(i) == file_handles.end())
+                    {
+                        ret = i;
+                        file_handles[i] = handle;
+                        break;
+                    }
+                }
+            }
+
+            printf("handle = %#010x\n", ret);
+        }
+    }
+    else
+    {
+        last_error = ERROR_INVALID_PARAMETER;
+    }
+
+    esp += 32;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateFileW(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t path_buf;
+    uint32_t dw_desired_access;
+    uint32_t dw_creation_disposition;
+    uint32_t dw_flags;
+    uint32_t ret = INVALID_HANDLE_VALUE;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &path_buf, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &dw_desired_access, 4));
+    // ignore share mode 12
+    // ignore security attrib 16
+    uc_assert(uc_mem_read(uc, esp + 20, &dw_creation_disposition, 4));
+    uc_assert(uc_mem_read(uc, esp + 24, &dw_flags, 4));
+    // ignore htemplate 28
+
+    if (path_buf != 0)
+    {
+        const auto u16path = read_u16string(uc, path_buf);
+        if (u16path == u"CONIN$")
+        {
+            ret = STDIN_HANDLE_VALUE;
+        }
+        else if (u16path == u"CONOUT$")
+        {
+            ret = STDOUT_HANDLE_VALUE;
+        }
+        else
+        {
+            const auto path = to_unix_path(u16path);
+            FILE *handle = nullptr;
+
+            logf("CreateFileW(%s, %#010x, %#010x)\n", path.c_str(), dw_desired_access, dw_creation_disposition);
+
+            if (dw_desired_access == 0xc0000000 && dw_creation_disposition == 4)
+            {
+                handle = fopen64(path.c_str(), "r+b");
+                if (handle == nullptr && errno == ENOENT)
+                {
+                    handle = fopen64(path.c_str(), "w+b");
+                }
+
+                if (handle != nullptr)
+                    fseek(handle, 0, SEEK_SET);
+            }
+            else if (dw_desired_access == 0x80000000 && dw_creation_disposition == 3)
+            {
+                handle = fopen64(path.c_str(), "rb");
+
+                if (handle != nullptr)
+                    fseek(handle, 0, SEEK_SET);
+            }
+            else if (dw_desired_access == 0x40000000 && dw_creation_disposition == 2)
+            {
+                handle = fopen64(path.c_str(), "w+b");
+
+                if (handle != nullptr)
+                    fseek(handle, 0, SEEK_SET);
+            }
+            else
+            {
+                logf("Unknown access type.\n");
+                for (;;)
+                    ;
+            }
+
+            if (handle == nullptr)
+            {
+                set_last_error(errno);
+                printf("errno: %d %#010x\n", errno, last_error);
+            }
+            else
+            {
+                for (uint32_t i = FILE_HANDLE_VALUE_OFFSET; i < (FILE_HANDLE_VALUE_OFFSET + 0xfffff); i++)
+                {
+                    if (file_handles.find(i) == file_handles.end())
+                    {
+                        ret = i;
+                        file_handles[i] = handle;
+                        break;
+                    }
+                }
+            }
+
+            printf("handle = %#010x\n", ret);
+        }
+    }
+    else
+    {
+        last_error = ERROR_INVALID_PARAMETER;
+    }
+
+    esp += 32;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateDirectoryA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t path_buf;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &path_buf, 4));
+    // ignore security attrib
+
+    if (path_buf != 0)
+    {
+        const auto path = to_unix_path(to_u16string(read_string(uc, path_buf)));
+
+        std::error_code err;
+        if (std::filesystem::create_directory(path, err))
+        {
+            ret = 1;
+        }
+        else
+        {
+            set_last_error(err);
+            ret = 0;
+        }
+    }
+
     esp += 12;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
@@ -352,6 +832,18 @@ static void cb_kernel32_IsDebuggerPresent(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static void cb_kernel32_GetUserDefaultLCID(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 1033;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+
+    esp += 4;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
 static void cb_kernel32_GetLastError(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
@@ -372,7 +864,7 @@ static void cb_kernel32_SetLastError(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 4, &new_error, 4));
     last_error = new_error;
 
-    logf("%#010x SetLastError(%#010x)\n", return_addr, new_error);
+    // logf("%#010x SetLastError(%#010x)\n", return_addr, new_error);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -562,7 +1054,7 @@ static void cb_kernel32_MultiByteToWideChar(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 20, &wide_string_buf, 4));
     uc_assert(uc_mem_read(uc, esp + 24, &wide_string_len, 4));
 
-    logf("MultiByteToWideChar(%#010x, %#010x, %#010x, %#010x, %#010x, %#010x)\n", codepage, dw_flags, mb_string_buf, mb_string_len, wide_string_buf, wide_string_len);
+    // logf("MultiByteToWideChar(%#010x, %#010x, %#010x, %#010x, %#010x, %#010x)\n", codepage, dw_flags, mb_string_buf, mb_string_len, wide_string_buf, wide_string_len);
 
     if (mb_string_buf != 0)
     {
@@ -587,7 +1079,7 @@ static void cb_kernel32_MultiByteToWideChar(uc_engine *uc, uint32_t esp)
         ret = target_len;
     }
 
-    logf("-> %d\n", ret);
+    // logf("-> %d\n", ret);
 
     esp += 28;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -619,7 +1111,7 @@ static void cb_kernel32_WideCharToMultiByte(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 28, &unknown_character_ptr, 4));
     uc_assert(uc_mem_read(uc, esp + 32, &has_used_unk_char_ptr, 4));
 
-    logf("WideCharToMultiByte(%#010x, %#010x, %#010x, %#010x, %#010x, %#010x, %#010x, %#010x)\n", codepage, dw_flags, wide_string_buf, wide_string_len, mb_string_buf, mb_string_len, unknown_character_ptr, has_used_unk_char_ptr);
+    // logf("WideCharToMultiByte(%#010x, %#010x, %#010x, %#010x, %#010x, %#010x, %#010x, %#010x)\n", codepage, dw_flags, wide_string_buf, wide_string_len, mb_string_buf, mb_string_len, unknown_character_ptr, has_used_unk_char_ptr);
 
     if (wide_string_buf != 0)
     {
@@ -645,7 +1137,7 @@ static void cb_kernel32_WideCharToMultiByte(uc_engine *uc, uint32_t esp)
         ret = target_len;
     }
 
-    logf("-> %d\n", ret);
+    // logf("-> %d\n", ret);
 
     esp += 36;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -682,6 +1174,131 @@ static void cb_kernel32_GetStdHandle(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static void cb_kernel32_ReadFile(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t file_handle;
+    uint32_t lp_buffer;
+    uint32_t bytes_to_read;
+    uint32_t bytes_read_ptr;
+    // lp_overlapped ignored
+    uint32_t ret = 0;
+    uint32_t bytes_read = 0;
+    uint8_t tmp_buffer[4096];
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &file_handle, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &lp_buffer, 4));
+    uc_assert(uc_mem_read(uc, esp + 12, &bytes_to_read, 4));
+    uc_assert(uc_mem_read(uc, esp + 16, &bytes_read_ptr, 4));
+
+    // logf("ReadFile(%#010x, %#010x, %d, %#010x, ???)\n", file_handle, lp_buffer, bytes_to_read, bytes_read_ptr);
+
+    auto handle = file_handles.find(file_handle);
+    if (handle != file_handles.end())
+    {
+        ret = 1;
+        while (bytes_to_read > 0)
+        {
+            if (bytes_to_read >= sizeof(tmp_buffer))
+            {
+                size_t bytes = fread(tmp_buffer, 1, sizeof(tmp_buffer), handle->second);
+
+                bytes_read += bytes;
+                bytes_to_read -= bytes;
+
+                uc_assert(uc_mem_write(uc, lp_buffer, &tmp_buffer, bytes));
+                uc_assert(uc_mem_write(uc, bytes_read_ptr, &bytes_read, 4));
+                lp_buffer += sizeof(tmp_buffer);
+
+                if (bytes != sizeof(tmp_buffer) || bytes_to_read == 0)
+                    break;
+            }
+            else
+            {
+                size_t bytes = fread(tmp_buffer, 1, bytes_to_read, handle->second);
+
+                bytes_read += bytes;
+                bytes_to_read -= bytes;
+
+                uc_assert(uc_mem_write(uc, lp_buffer, &tmp_buffer, bytes));
+                uc_assert(uc_mem_write(uc, bytes_read_ptr, &bytes_read, 4));
+
+                break;
+            }
+        }
+    }
+    else
+    {
+        // logf("invalid handle.\n");
+        ret = 0;
+        last_error = ERROR_INVALID_HANDLE;
+    }
+
+    esp += 24;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_WriteFile(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t file_handle;
+    uint32_t lp_buffer;
+    uint32_t bytes_to_write;
+    uint32_t bytes_written_ptr;
+    // lp_overlapped ignored
+    uint32_t ret = 0;
+    uint32_t bytes_written = 0;
+    uint8_t tmp_buffer[4096];
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &file_handle, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &lp_buffer, 4));
+    uc_assert(uc_mem_read(uc, esp + 12, &bytes_to_write, 4));
+    uc_assert(uc_mem_read(uc, esp + 16, &bytes_written_ptr, 4));
+
+    logf("WriteFile(%#010x, %#010x, %d, %#010x, ???)\n", file_handle, lp_buffer, bytes_to_write, bytes_written_ptr);
+
+    auto handle = file_handles.find(file_handle);
+    if (handle != file_handles.end())
+    {
+        ret = 1;
+        while (bytes_to_write > 0)
+        {
+            if (bytes_to_write >= sizeof(tmp_buffer))
+            {
+                uc_assert(uc_mem_read(uc, lp_buffer, &tmp_buffer, sizeof(tmp_buffer)));
+                size_t bytes = fwrite(tmp_buffer, 1, sizeof(tmp_buffer), handle->second);
+                lp_buffer += sizeof(tmp_buffer);
+                bytes_written += bytes;
+                bytes_to_write -= bytes;
+                uc_assert(uc_mem_write(uc, bytes_written_ptr, &bytes_written, 4));
+            }
+            else
+            {
+                uc_assert(uc_mem_read(uc, lp_buffer, &tmp_buffer, bytes_to_write));
+                size_t bytes = fwrite(tmp_buffer, 1, bytes_to_write, handle->second);
+                bytes_written += bytes;
+                bytes_to_write -= bytes;
+
+                uc_assert(uc_mem_write(uc, bytes_written_ptr, &bytes_written, 4));
+                break;
+            }
+        }
+    }
+    else
+    {
+        logf("invalid handle.\n");
+        ret = 0;
+        last_error = ERROR_INVALID_HANDLE;
+    }
+
+    esp += 24;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
 static void cb_kernel32_GetFileType(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
@@ -698,11 +1315,76 @@ static void cb_kernel32_GetFileType(uc_engine *uc, uint32_t esp)
         ret = 2; // FILE_TYPE_CHAR
         break;
     default:
-        // todo interact with real FS
-        break;
+    {
+        auto handle = file_handles.find(file_handle);
+        if (handle != file_handles.end())
+        {
+            ret = 1;
+        }
+    }
+    break;
     }
 
+    // logf("GetFileType(%#010x) -> %d\n", file_handle, ret);
+
     esp += 8;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_SetFilePointer(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t file_handle;
+    uint32_t pos_lo;
+    uint32_t pos_hi_ptr; // why
+    uint32_t origin;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &file_handle, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &pos_lo, 4));
+    uc_assert(uc_mem_read(uc, esp + 12, &pos_hi_ptr, 4));
+    uc_assert(uc_mem_read(uc, esp + 16, &origin, 4));
+
+    if (pos_lo == -1)
+        pos_lo = 0;
+
+    auto handle = file_handles.find(file_handle);
+    if (handle != file_handles.end())
+    {
+        // uint32_t pos = pos_lo;
+        // uint32_t pos_hi = 0;
+        // if (pos_hi_ptr != 0) uc_assert(uc_mem_read(uc, pos_hi_ptr, &pos_hi, 4));
+        // pos |= uint64_t(pos_hi) << 32;
+
+        int posix_origin = 0;
+        if (origin == 0)
+            posix_origin = SEEK_SET;
+        else if (origin == 1)
+            posix_origin = SEEK_CUR;
+        else if (origin == 2)
+            posix_origin = SEEK_END;
+
+        if (fseek(handle->second, pos_lo, posix_origin) >= 0)
+        {
+            uint32_t pos_new = ftell(handle->second);
+            // pos_hi = (uint64_t(pos_new) >> 32);
+            // ret = pos_new & 0xffffffff;
+            ret = pos_new;
+
+            // if (pos_hi_ptr != 0) uc_assert(uc_mem_write(uc, pos_hi_ptr, &pos_hi, 4));
+
+            logf("SetFilePointer(%#010x, %d, %d) seek to %#010lx\n", file_handle, pos_lo, origin, pos_new);
+        }
+        else
+        {
+            set_last_error(errno);
+            ret = 0xffffffff;
+        }
+    }
+
+    esp += 20;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
@@ -723,7 +1405,7 @@ static void cb_kernel32_InitializeCriticalSectionAndSpinCount(uc_engine *uc, uin
         crit_sections[lp_crit_section] = 0;
         ret = 1;
     }
-    logf("%#010x InitializeCriticalSectionAndSpinCount(%#010x, %d) -> %d\n", return_addr, lp_crit_section, dw_spin_count, ret);
+    // logf("%#010x InitializeCriticalSectionAndSpinCount(%#010x, %d) -> %d\n", return_addr, lp_crit_section, dw_spin_count, ret);
 
     esp += 12;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -744,7 +1426,7 @@ static void cb_kernel32_InitializeCriticalSection(uc_engine *uc, uint32_t esp)
         crit_sections[lp_crit_section] = 0;
         ret = 1;
     }
-    logf("%#010x InitializeCriticalSection(%#010x) -> %d\n", return_addr, lp_crit_section, ret);
+    // logf("%#010x InitializeCriticalSection(%#010x) -> %d\n", return_addr, lp_crit_section, ret);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -769,7 +1451,7 @@ static void cb_kernel32_InitializeCriticalSectionEx(uc_engine *uc, uint32_t esp)
         crit_sections[lp_crit_section] = 0;
         ret = 1;
     }
-    logf("%#010x InitializeCriticalSectionEx(%#010x, %d, %#010x) -> %d\n", return_addr, lp_crit_section, dw_spin_count, flags, ret);
+    // logf("%#010x InitializeCriticalSectionEx(%#010x, %d, %#010x) -> %d\n", return_addr, lp_crit_section, dw_spin_count, flags, ret);
 
     esp += 16;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -785,7 +1467,7 @@ static void cb_kernel32_DeleteCriticalSection(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 4, &lp_crit_section, 4));
 
     crit_sections.erase(lp_crit_section);
-    logf("%#010x DeleteCriticalSection(%#010x)\n", return_addr, lp_crit_section);
+    // logf("%#010x DeleteCriticalSection(%#010x)\n", return_addr, lp_crit_section);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -800,7 +1482,7 @@ static void cb_kernel32_EnterCriticalSection(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 4, &lp_crit_section, 4));
 
     // no op till we get threading
-    logf("%#010x EnterCriticalSection(%#010x)\n", return_addr, lp_crit_section);
+    // logf("%#010x EnterCriticalSection(%#010x)\n", return_addr, lp_crit_section);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -815,7 +1497,7 @@ static void cb_kernel32_LeaveCriticalSection(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 4, &lp_crit_section, 4));
 
     // no op till we get threading
-    logf("%#010x LeaveCriticalSection(%#010x)\n", return_addr, lp_crit_section);
+    // logf("%#010x LeaveCriticalSection(%#010x)\n", return_addr, lp_crit_section);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -839,7 +1521,7 @@ static void cb_kernel32_TlsAlloc(uc_engine *uc, uint32_t esp)
     }
     // todo lasterror
 
-    logf("%#010x TlsAlloc() -> %#010x\n", return_addr, ret);
+    // logf("%#010x TlsAlloc() -> %#010x\n", return_addr, ret);
 
     esp += 4;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -857,7 +1539,7 @@ static void cb_kernel32_TlsFree(uc_engine *uc, uint32_t esp)
 
     ret = fiber_storage.erase(index);
 
-    logf("%#010x TlsFree(%#010x) -> %d\n", return_addr, index, ret);
+    // logf("%#010x TlsFree(%#010x) -> %d\n", return_addr, index, ret);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -883,7 +1565,7 @@ static void cb_kernel32_TlsSetValue(uc_engine *uc, uint32_t esp)
         // todo lasterror
     }
 
-    logf("%#010x TlsSetValue(%d, %#010x) -> %#010x\n", return_addr, slot, data, ret);
+    // logf("%#010x TlsSetValue(%d, %#010x) -> %#010x\n", return_addr, slot, data, ret);
     esp += 12;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
@@ -909,7 +1591,7 @@ static void cb_kernel32_TlsGetValue(uc_engine *uc, uint32_t esp)
         // todo lasterror
     }
 
-    logf("%#010x TlsGetValue(%d) -> %#010x\n", return_addr, slot, ret);
+    // logf("%#010x TlsGetValue(%d) -> %#010x\n", return_addr, slot, ret);
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
@@ -941,7 +1623,7 @@ static void cb_kernel32_FlsAlloc(uc_engine *uc, uint32_t esp)
     }
     // todo lasterror
 
-    logf("%#010x FlsAlloc(%#010x) -> %#010x\n", return_addr, callback, ret);
+    // logf("%#010x FlsAlloc(%#010x) -> %#010x\n", return_addr, callback, ret);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -960,7 +1642,7 @@ static void cb_kernel32_FlsFree(uc_engine *uc, uint32_t esp)
     ret = fiber_storage.erase(index);
     fiber_callbacks.erase(index); // no stuff we run uses fibers so we will ignore the callback for now.
 
-    logf("%#010x FlsFree(%#010x) -> %#010x\n", return_addr, index, ret);
+    // logf("%#010x FlsFree(%#010x) -> %#010x\n", return_addr, index, ret);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -986,7 +1668,7 @@ static void cb_kernel32_FlsSetValue(uc_engine *uc, uint32_t esp)
         // todo lasterror
     }
 
-    logf("%#010x FlsSetValue(%d, %#010x) -> %#010x\n", return_addr, slot, data, ret);
+    // logf("%#010x FlsSetValue(%d, %#010x) -> %#010x\n", return_addr, slot, data, ret);
     esp += 12;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
@@ -1012,7 +1694,7 @@ static void cb_kernel32_FlsGetValue(uc_engine *uc, uint32_t esp)
         // todo lasterror
     }
 
-    logf("%#010x FlsGetValue(%d) -> %#010x\n", return_addr, slot, ret);
+    // logf("%#010x FlsGetValue(%d) -> %#010x\n", return_addr, slot, ret);
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
@@ -1033,7 +1715,7 @@ static void cb_kernel32_HeapCreate(uc_engine *uc, uint32_t esp)
 
     // no need to handle that for now
     ret = curr_heap_handle;
-    logf("%#010x HeapCreate(%#010x, %d, %d) -> %#010x\n", return_addr, fl_options, initial_size, max_size, ret);
+    // logf("%#010x HeapCreate(%#010x, %d, %d) -> %#010x\n", return_addr, fl_options, initial_size, max_size, ret);
 
     esp += 16;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -1049,7 +1731,7 @@ static void cb_kernel32_HeapDestroy(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
     uc_assert(uc_mem_read(uc, esp + 4, &heap_handle, 4));
 
-    logf("%#010x HeapDestroy(%#010x) -> %d\n", return_addr, heap_handle, ret);
+    // logf("%#010x HeapDestroy(%#010x) -> %d\n", return_addr, heap_handle, ret);
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -1081,7 +1763,7 @@ static void cb_kernel32_HeapAlloc(uc_engine *uc, uint32_t esp)
         ret = ptr;
     }
 
-    logf("%#010x HeapAlloc(%#010x, %#010x, %d) -> %#010x\n", return_addr, heap_handle, flags, size, ret);
+    // logf("%#010x HeapAlloc(%#010x, %#010x, %d) -> %#010x\n", return_addr, heap_handle, flags, size, ret);
 
     esp += 16;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -1109,7 +1791,7 @@ static void cb_kernel32_HeapFree(uc_engine *uc, uint32_t esp)
         tinyalloc::ta_free(&allocator, (void *)host_ptr);
     }
 
-    logf("%#010x HeapFree(%#010x, %#010x, %#010x) -> %#010x\n", return_addr, heap_handle, flags, ptr, ret);
+    // logf("%#010x HeapFree(%#010x, %#010x, %#010x) -> %#010x\n", return_addr, heap_handle, flags, ptr, ret);
 
     esp += 16;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -1155,6 +1837,19 @@ static void cb_kernel32_HeapSize(uc_engine *uc, uint32_t esp)
         ret = -1;
 
     esp += 16;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_GlobalAlloc(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 0;
+
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+
+    esp += 12;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
@@ -1300,6 +1995,32 @@ static void cb_kernel32_GetModuleHandleExW(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static void cb_kernel32_GetModuleHandleA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t name_addr;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &name_addr, 4));
+    esp += 8;
+
+    if (name_addr == 0)
+    {
+        ret = curr_module_handle;
+    }
+    else
+    {
+        auto mod_name = to_u16string(read_string(uc, name_addr));
+        ret = handle_from(mod_name);
+
+        //logf("GetModuleHandleA(%s) called\n", mod_name.c_str());
+    }
+
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
 static void cb_kernel32_GetModuleHandleW(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
@@ -1318,7 +2039,7 @@ static void cb_kernel32_GetModuleHandleW(uc_engine *uc, uint32_t esp)
         auto mod_name = read_u16string(uc, name_addr);
         ret = handle_from(mod_name);
 
-        //logf("GetModuleHandle(%s) called\n", mod_name.c_str());
+        //logf("GetModuleHandleW(%s) called\n", mod_name.c_str());
     }
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -1430,7 +2151,7 @@ static void cb_kernel32_GetTickCount(uc_engine *uc, uint32_t esp)
     time_value = time_now.tv_sec * 1000 + (time_now.tv_nsec / 1000000);
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
-    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &time_now));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &time_value));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
@@ -1619,7 +2340,7 @@ static void cb_kernel32_Sleep(uc_engine *uc, uint32_t esp)
 
     usleep(time * 1000);
 
-    logf("%#010x Sleep(%d)\n", return_addr, time);
+    // logf("%#010x Sleep(%d)\n", return_addr, time);
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
@@ -1669,18 +2390,38 @@ static void cb_kernel32_SetUnhandledExceptionFilter(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
-static void cb_kernel32_OpenMutexW(uc_engine *uc, uint32_t esp)
+static void cb_kernel32_OpenMutexA(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
-    uint32_t desired_access;
-    bool inherit_handle;
-    uint32_t name;
+    // uint32_t desired_access;
+    // bool inherit_handle;
+    // uint32_t name;
     uint32_t ret = 0;
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
-    uc_assert(uc_mem_read(uc, esp + 4, &desired_access, 4));
-    uc_assert(uc_mem_read(uc, esp + 8, &inherit_handle, 1));
-    uc_assert(uc_mem_read(uc, esp + 12, &name, 4));
+    // uc_assert(uc_mem_read(uc, esp + 4, &desired_access, 4));
+    // uc_assert(uc_mem_read(uc, esp + 8, &inherit_handle, 1));
+    // uc_assert(uc_mem_read(uc, esp + 12, &name, 4));
+
+    esp += 16;
+
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_OpenMutexW(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    // uint32_t desired_access;
+    // bool inherit_handle;
+    // uint32_t name;
+    uint32_t ret = 0;
+
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    // uc_assert(uc_mem_read(uc, esp + 4, &desired_access, 4));
+    // uc_assert(uc_mem_read(uc, esp + 8, &inherit_handle, 1));
+    // uc_assert(uc_mem_read(uc, esp + 12, &name, 4));
 
     esp += 16;
 
@@ -1809,6 +2550,113 @@ static void cb_kernel32_GetCPInfo(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static void cb_kernel32_OutputDebugStringA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t string_buf;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &string_buf, 4));
+
+    if (string_buf != 0)
+    {
+        auto msg = read_string(uc, string_buf);
+        logf("DEBUG OUT: %s\n", msg.c_str());
+    }
+
+    esp += 8;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateEventA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 1;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+
+    esp += 28;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateEventW(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 1;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+
+    esp += 28;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateMutexA(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+
+    esp += 16;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateMutexW(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+
+    esp += 16;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_GetLocalTime(uc_engine *uc, uint32_t esp)
+{
+    uint32_t systime_ptr;
+    uint32_t return_addr;
+    uint32_t ret = 0;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &systime_ptr, 4));
+
+    if (systime_ptr != 0)
+    {
+        struct timeval t_now;
+        time_t timer;
+        time(&timer);
+        gettimeofday(&t_now, nullptr);
+        struct tm *t = localtime(&timer);
+
+        int16_t tmp;
+        tmp = 1900 + t->tm_year;
+        uc_assert(uc_mem_write(uc, systime_ptr, &tmp, 2));
+        tmp = 1 + t->tm_mon;
+        uc_assert(uc_mem_write(uc, systime_ptr + 2, &tmp, 2));
+        tmp = t->tm_wday;
+        uc_assert(uc_mem_write(uc, systime_ptr + 4, &tmp, 2));
+        tmp = t->tm_mday;
+        uc_assert(uc_mem_write(uc, systime_ptr + 6, &tmp, 2));
+        tmp = t->tm_hour;
+        uc_assert(uc_mem_write(uc, systime_ptr + 8, &tmp, 2));
+        tmp = t->tm_min;
+        uc_assert(uc_mem_write(uc, systime_ptr + 10, &tmp, 2));
+        tmp = t->tm_sec;
+        uc_assert(uc_mem_write(uc, systime_ptr + 12, &tmp, 2));
+        tmp = t_now.tv_usec / 1000;
+        uc_assert(uc_mem_write(uc, systime_ptr + 14, &tmp, 2));
+    }
+
+    esp += 8;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
 void install_kernel32_exports(uc_engine *uc)
 {
     {
@@ -1825,8 +2673,35 @@ void install_kernel32_exports(uc_engine *uc)
 
     ptr_secret = random() ^ random() ^ random() - 0xf35d7c1a;
 
+    file_handles[STDIN_HANDLE_VALUE] = stdin;
+    file_handles[STDOUT_HANDLE_VALUE] = stdout;
+
+    Export FindFirstFileA_ex = {"FindFirstFileA", cb_kernel32_FindFirstFileA};
+    exports["FindFirstFileA"] = FindFirstFileA_ex;
+
     Export FindFirstFileW_ex = {"FindFirstFileW", cb_kernel32_FindFirstFileW};
     exports["FindFirstFileW"] = FindFirstFileW_ex;
+
+    Export FindNextFileA_ex = {"FindNextFileA", cb_kernel32_FindNextFileA};
+    exports["FindNextFileA"] = FindNextFileA_ex;
+
+    Export FindNextFileW_ex = {"FindNextFileW", cb_kernel32_FindNextFileW};
+    exports["FindNextFileW"] = FindNextFileW_ex;
+
+    Export FindClose_ex = {"FindClose", cb_kernel32_FindClose};
+    exports["FindClose"] = FindClose_ex;
+
+    Export CloseHandle_ex = {"CloseHandle", cb_kernel32_CloseHandle};
+    exports["CloseHandle"] = CloseHandle_ex;
+
+    Export CreateFileA_ex = {"CreateFileA", cb_kernel32_CreateFileA};
+    exports["CreateFileA"] = CreateFileA_ex;
+
+    Export CreateFileW_ex = {"CreateFileW", cb_kernel32_CreateFileW};
+    exports["CreateFileW"] = CreateFileW_ex;
+
+    Export CreateDirectoryA_ex = {"CreateDirectoryA", cb_kernel32_CreateDirectoryA};
+    exports["CreateDirectoryA"] = CreateDirectoryA_ex;
 
     Export CreateDirectoryW_ex = {"CreateDirectoryW", cb_kernel32_CreateDirectoryW};
     exports["CreateDirectoryW"] = CreateDirectoryW_ex;
@@ -1839,6 +2714,9 @@ void install_kernel32_exports(uc_engine *uc)
 
     Export IsDebuggerPresent_ex = {"IsDebuggerPresent", cb_kernel32_IsDebuggerPresent};
     exports["IsDebuggerPresent"] = IsDebuggerPresent_ex;
+
+    Export GetUserDefaultLCID_ex = {"GetUserDefaultLCID", cb_kernel32_GetUserDefaultLCID};
+    exports["GetUserDefaultLCID"] = GetUserDefaultLCID_ex;
 
     Export GetLastError_ex = {"GetLastError", cb_kernel32_GetLastError};
     exports["GetLastError"] = GetLastError_ex;
@@ -1873,8 +2751,17 @@ void install_kernel32_exports(uc_engine *uc)
     Export GetStdHandle_ex = {"GetStdHandle", cb_kernel32_GetStdHandle};
     exports["GetStdHandle"] = GetStdHandle_ex;
 
+    Export ReadFile_ex = {"ReadFile", cb_kernel32_ReadFile};
+    exports["ReadFile"] = ReadFile_ex;
+
+    Export WriteFile_ex = {"WriteFile", cb_kernel32_WriteFile};
+    exports["WriteFile"] = WriteFile_ex;
+
     Export GetFileType_ex = {"GetFileType", cb_kernel32_GetFileType};
     exports["GetFileType"] = GetFileType_ex;
+
+    Export SetFilePointer_ex = {"SetFilePointer", cb_kernel32_SetFilePointer};
+    exports["SetFilePointer"] = SetFilePointer_ex;
 
     Export InitializeCriticalSectionAndSpinCount_ex = {"InitializeCriticalSectionAndSpinCount", cb_kernel32_InitializeCriticalSectionAndSpinCount};
     exports["InitializeCriticalSectionAndSpinCount"] = InitializeCriticalSectionAndSpinCount_ex;
@@ -1936,6 +2823,9 @@ void install_kernel32_exports(uc_engine *uc)
     Export HeapSize_ex = {"HeapSize", cb_kernel32_HeapSize};
     exports["HeapSize"] = HeapSize_ex;
 
+    Export GlobalAlloc_ex = {"GlobalAlloc", cb_kernel32_GlobalAlloc};
+    exports["GlobalAlloc"] = GlobalAlloc_ex;
+
     Export GetVersionExW_ex = {"GetVersionExW", cb_kernel32_GetVersionExW};
     exports["GetVersionExW"] = GetVersionExW_ex;
 
@@ -1953,6 +2843,9 @@ void install_kernel32_exports(uc_engine *uc)
 
     Export LoadLibraryExW_ex = {"LoadLibraryExW", cb_kernel32_LoadLibraryExW};
     exports["LoadLibraryExW"] = LoadLibraryExW_ex;
+
+    Export GetModuleHandleA_ex = {"GetModuleHandleA", cb_kernel32_GetModuleHandleA};
+    exports["GetModuleHandleA"] = GetModuleHandleA_ex;
 
     Export GetModuleHandleW_ex = {"GetModuleHandleW", cb_kernel32_GetModuleHandleW};
     exports["GetModuleHandleW"] = GetModuleHandleW_ex;
@@ -2002,6 +2895,9 @@ void install_kernel32_exports(uc_engine *uc)
     Export SetUnhandledExceptionFilter_ex = {"SetUnhandledExceptionFilter", cb_kernel32_SetUnhandledExceptionFilter};
     exports["SetUnhandledExceptionFilter"] = SetUnhandledExceptionFilter_ex;
 
+    Export OpenMutexA_ex = {"OpenMutexA", cb_kernel32_OpenMutexA};
+    exports["OpenMutexA"] = OpenMutexA_ex;
+
     Export OpenMutexW_ex = {"OpenMutexW", cb_kernel32_OpenMutexW};
     exports["OpenMutexW"] = OpenMutexW_ex;
 
@@ -2025,4 +2921,22 @@ void install_kernel32_exports(uc_engine *uc)
 
     Export GetCPInfo_ex = {"GetCPInfo", cb_kernel32_GetCPInfo};
     exports["GetCPInfo"] = GetCPInfo_ex;
+
+    Export OutputDebugStringA_ex = {"OutputDebugStringA", cb_kernel32_OutputDebugStringA};
+    exports["OutputDebugStringA"] = OutputDebugStringA_ex;
+
+    Export CreateEventA_ex = {"CreateEventA", cb_kernel32_CreateEventA};
+    exports["CreateEventA"] = CreateEventA_ex;
+
+    Export CreateEventW_ex = {"CreateEventW", cb_kernel32_CreateEventW};
+    exports["CreateEventW"] = CreateEventW_ex;
+
+    Export CreateMutexA_ex = {"CreateMutexA", cb_kernel32_CreateMutexA};
+    exports["CreateMutexA"] = CreateMutexA_ex;
+
+    Export CreateMutexW_ex = {"CreateMutexW", cb_kernel32_CreateMutexW};
+    exports["CreateMutexW"] = CreateMutexW_ex;
+
+    Export GetLocalTime_ex = {"GetLocalTime", cb_kernel32_GetLocalTime};
+    exports["GetLocalTime"] = GetLocalTime_ex;
 }

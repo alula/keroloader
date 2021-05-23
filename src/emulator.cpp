@@ -119,10 +119,12 @@ uint32_t stack_size = 0x100000;
 uint32_t jit_last = jit_base;
 uint32_t jit_size = 0;
 
+bool emu_nointerrupt = false;
 uint32_t emu_spinlock_thunk = 0;
 uint32_t emu_spinlock_lock = 0xf0000ff8;
 
 std::unordered_map<std::string, uint32_t> import_cache;
+std::vector<std::string> unresolved_imports;
 static std::string export_log = "";
 
 uint32_t last_error = 0;
@@ -309,6 +311,24 @@ uint32_t add_syscall(uc_engine *uc, uint32_t id, void (*cb)(uc_engine *, uint32_
     return push_jitregion(uc, thunk, sizeof(thunk));
 }
 
+uint32_t add_unresolved_stub(uc_engine *uc, std::string s)
+{
+    uint8_t thunk[8];
+    uc_err err;
+    uint32_t thunk_addr = 0;
+
+    unresolved_imports.push_back(s);
+    uint32_t idx = unresolved_imports.size() - 1;
+
+    memset(thunk, 0xcc, sizeof(thunk));
+    thunk[0] = 0x68; // push id
+    memcpy(&thunk[1], &idx, 4);
+    thunk[5] = 0xcd; // int 0x56
+    thunk[6] = 0x56;
+
+    return push_jitregion(uc, thunk, sizeof(thunk));
+}
+
 peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
 {
     logf("Loading file: %s\n", name);
@@ -382,18 +402,23 @@ peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
     peparse::IterExpVA(
         pe, [](void *p, const peparse::VA &export_addr, const std::string &mod_name, const std::string &sym_name) -> int
         {
+            uint32_t addr = (uint32_t)export_addr;
             auto cached = import_cache.find(sym_name);
-            if (cached == import_cache.end())
+            if (cached == import_cache.end() && exports.find(sym_name) == exports.end())
             {
-                logf("Export: %s!%s -> %#010lx\n", mod_name.c_str(), sym_name.c_str(), export_addr);
-                import_cache[sym_name] = (uint32_t)export_addr;
+                // logf("Export: %s!%s -> %#010lx\n", mod_name.c_str(), sym_name.c_str(), export_addr);
+                Export ex = {sym_name, nullptr, nullptr, 0, addr};
+                exports[sym_name] = ex;
+                import_cache[sym_name] = export_addr;
+            }
 
-                if (exports.find(sym_name) == exports.end())
-                {
-                    Export ex = {sym_name, nullptr, nullptr, 0, export_addr};
-                    exports[sym_name] = ex;
-                    exports["_" + sym_name] = ex;
-                }
+            auto sym2 = "_" + sym_name;
+            cached = import_cache.find(sym2);
+            if (cached == import_cache.end() && exports.find(sym2) == exports.end())
+            {
+                Export ex = {sym2, nullptr, nullptr, 0, addr};
+                exports[sym2] = ex;
+                import_cache[sym2] = addr;
             }
 
             return 0;
@@ -443,7 +468,24 @@ peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
                     throw std::runtime_error(msg);
                 }
 
-                sprintf(buff, "%s: %#010x -> %#010x\n", sym_name.c_str(), import_addr, addr);
+                sprintf(buff, "Link: %s: %#010x -> %#010x\n", sym_name.c_str(), import_addr, addr);
+                export_log += buff;
+            }
+            else
+            {
+                uint32_t addr = add_unresolved_stub(uc, sym_name);
+
+                uc_err err = uc_mem_write(uc, import_addr, &addr, 4);
+                if (err != UC_ERR_OK)
+                {
+                    std::string msg = "Failed to link IAT entry: ";
+                    msg += uc_strerror(err);
+                    msg += " (" + std::to_string(err) + ")";
+
+                    throw std::runtime_error(msg);
+                }
+
+                sprintf(buff, "Unresolved link stub: %s: %#010x -> %#010x\n", sym_name.c_str(), import_addr, addr);
                 export_log += buff;
             }
 
@@ -461,8 +503,8 @@ static bool hook_segfault(uc_engine *uc, uc_mem_type type,
     thread->save_regs(uc);
 
     logf("Access Violation at %#010x [addr=%#010lx, size=%#010x, value=%#010lx]\n", thread->eip, address, size, value);
-    thread->print_stack(uc);
-    //thread->print_regs();
+    // thread->print_stack(uc);
+    // thread->print_regs();
 
     uc_emu_stop(uc);
     emu_failed = true;
@@ -514,6 +556,29 @@ static bool hook_interrupt(uc_engine *uc, uint32_t int_num, void *user_data)
 
         return true;
     }
+    case 0x56: // unresolved link breakpoint
+    {
+        uint32_t esp;
+        uint32_t eip;
+        uint32_t index;
+        std::string name = "(unknown)";
+
+        uc_assert(uc_reg_read(uc, UC_X86_REG_ESP, &esp));
+        uc_assert(uc_mem_read(uc, esp, &index, 4));
+        uc_assert(uc_mem_read(uc, esp + 4, &eip, 4));
+        esp += 4;
+
+        if (index < unresolved_imports.size())
+        {
+            name = unresolved_imports[index];
+        }
+
+        logf("Reached unresolved function: %s (called from %#010x)\n", name.c_str(), eip - 6);
+        uc_emu_stop(uc);
+        emu_failed = true;
+
+        return true;
+    }
     }
 
     logf("Unhandled interrupt: %#02x\n", int_num);
@@ -540,17 +605,21 @@ void emu_loop()
     if (emu_failed)
         return;
 
-    uc_assert(uc_reg_read(uc, UC_X86_REG_EIP, &curr_thread_ref->eip));
-    uc_err err = uc_emu_start(uc, curr_thread_ref->eip, 0, 10000, 100000);
-    if (err != UC_ERR_OK)
+    do
     {
-        logf("Emulation error: %s (%u)\n", uc_strerror(err), err);
-        logf("Export log:\n%s\n", export_log.c_str());
+        uc_assert(uc_reg_read(uc, UC_X86_REG_EIP, &curr_thread_ref->eip));
+        uc_err err = uc_emu_start(uc, curr_thread_ref->eip, 0, 10000, 500000);
+        if (err != UC_ERR_OK)
+        {
+            logf("Emulation error: %s (%u)\n", uc_strerror(err), err);
+            logf("Export log:\n%s\n", export_log.c_str());
 
-        curr_thread_ref->save_regs(uc);
-        curr_thread_ref->print_regs();
-        emu_failed = true;
-    }
+            curr_thread_ref->save_regs(uc);
+            curr_thread_ref->print_regs();
+            emu_failed = true;
+            emu_nointerrupt = false;
+        }
+    } while (emu_nointerrupt);
 }
 
 int emu_init()
@@ -591,7 +660,7 @@ int emu_init()
     {
         install_exports(uc);
         auto dll_pe = load_pe(uc, "msvcrt.dll");
-        pe = load_pe(uc, "KeroBlaster.exe");
+        pe = load_pe(uc, "KeroBlasterPLAYISM.exe");
 
         uc_hook segfault;
         uc_hook interrupt;
@@ -684,7 +753,8 @@ int emu_init()
 
         uc_assert(uc_hook_add(uc, &segfault, UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, (void *)hook_segfault, main_thread, 1, 0), "Failed to register segfault hook");
         uc_assert(uc_hook_add(uc, &interrupt, UC_HOOK_INTR, (void *)hook_interrupt, main_thread, 1, 0), "Failed to register interrupt hook");
-        uc_assert(uc_hook_add(uc, &trace, UC_HOOK_CODE, (void *)hook_trace, main_thread, image_base, 0x80000000), "Failed to register trace hook");
+        // uc_assert(uc_hook_add(uc, &trace, UC_HOOK_CODE, (void *)hook_trace, main_thread, 0x48e000, 0x48f700), "Failed to register trace hook");
+        // printf("%s\n", export_log.c_str());
     }
     catch (std::exception &e)
     {

@@ -3,8 +3,19 @@
 #include <locale>
 #include <cuchar>
 #include <cwchar>
+#include <iomanip>
 #include <unicorn/unicorn.h>
 #include "common.h"
+
+template <typename T>
+std::string int_to_hex(T i)
+{
+    std::stringstream stream;
+    stream << "0x"
+           << std::setfill('0') << std::setw(sizeof(T) * 2)
+           << std::hex << i;
+    return stream.str();
+}
 
 std::pair<std::string, std::string> split_unix_path(std::string const &u)
 {
@@ -71,8 +82,6 @@ std::string to_utf8string(std::u16string const &u)
 
 std::u16string to_u16string(std::string const &u)
 {
-    //std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
-    //return convert.from_bytes(u);
     std::u16string out;
     mbstate_t state;
     char16_t c;
