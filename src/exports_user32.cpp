@@ -8,37 +8,18 @@
 #include "sokol/imconfig.h"
 #include "sokol/sokol_app.h"
 
-/*
-PeekMessageW:
-    mov eax, [DWORD PTR 0xf0300000]
-    mov ecx, [DWORD PTR 0xf0300004]
-    test eax, eax
-    jz loopend
-    test ecx, ecx
-    jz loopend
-    mov esi, 0xf0300008
-loopp:
-    push ecx
-    push eax
-    push [esi+12]
-    push [esi+8]
-    push [esi+4]
-    push [esi]
-    call eax
-    pop eax
-    pop ecx
-    add esi, 16
-    loop loopp
-loopend:
-    mov [DWORD PTR 0xf0300004], 0
-    xor eax, eax
-    ret 20
- */
+// x86/dispatcher.asm
 static uint8_t code_dispatcher[] = {0xA1, 0x00, 0x00, 0x30, 0xF0, 0x8B, 0x0D, 0x04, 0x00, 0x30, 0xF0, 0x85, 0xC0, 0x74,
-                                    0x1F, 0x85, 0xC9, 0x74, 0x1B, 0xBE, 0x08, 0x00, 0x30, 0xF0, 0x51, 0x50, 0xFF, 0x76,
+                                    0x29, 0x85, 0xC9, 0x74, 0x25, 0xBE, 0x08, 0x00, 0x30, 0xF0, 0x51, 0x50, 0xFF, 0x76,
                                     0x0C, 0xFF, 0x76, 0x08, 0xFF, 0x76, 0x04, 0xFF, 0x36, 0xFF, 0xD0, 0x58, 0x59, 0x83,
                                     0xC6, 0x10, 0xE2, 0xEA, 0xC7, 0x05, 0x04, 0x00, 0x30, 0xF0, 0x00, 0x00, 0x00, 0x00,
-                                    0x31, 0xC0, 0xC2, 0x14, 0x00};
+                                    0x8B, 0x0D, 0x08, 0x20, 0x30, 0xF0, 0x85, 0xC9, 0x74, 0x52, 0xBE, 0x18, 0x20, 0x30,
+                                    0xF0, 0x8B, 0x06, 0x83, 0xF8, 0x00, 0x74, 0x0C, 0x83, 0xF8, 0x01, 0x74, 0x12, 0x83,
+                                    0xF8, 0x02, 0x74, 0x18, 0xEB, 0x2E, 0xA1, 0x0C, 0x20, 0x30, 0xF0, 0x85, 0xC0, 0x74,
+                                    0x25, 0xEB, 0x14, 0xA1, 0x10, 0x20, 0x30, 0xF0, 0x85, 0xC0, 0x74, 0x1A, 0xEB, 0x09,
+                                    0xA1, 0x14, 0x20, 0x30, 0xF0, 0x85, 0xC0, 0x74, 0x0F, 0x51, 0x50, 0xFF, 0x76, 0x08,
+                                    0xFF, 0x76, 0x04, 0xFF, 0xD0, 0x58, 0x59, 0x83, 0xC6, 0x0C, 0xE2, 0xBD, 0xC7, 0x05,
+                                    0x08, 0x20, 0x30, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x31, 0xC0, 0xC2, 0x14, 0x00};
 
 constexpr uint32_t user_mem_base = 0xf0300000;
 struct wndproc_msg_t
@@ -49,28 +30,55 @@ struct wndproc_msg_t
     uint32_t rparam;
 };
 
+struct touch_msg_t
+{
+    int type; // 0 = start, 1 = move, 2 = end
+    float x;
+    float y;
+};
+
 union user32_mem_t
 {
     struct
     {
-        uint32_t wndproc_addr;
-        uint32_t message_count;
-        wndproc_msg_t messages[512];
+        uint32_t wndproc_addr;          // 0xf0300000
+        uint32_t message_count;         // 0xf0300004
+        wndproc_msg_t messages[512];    // 0xf0300008
+        uint32_t touch_msg_count;       // 0xf0302008
+        uint32_t touch_start_proc;      // 0xf030200c
+        uint32_t touch_move_proc;       // 0xf0302010
+        uint32_t touch_end_proc;        // 0xf0302014
+        touch_msg_t touch_messages[32]; // 0xf0302018
     } data;
     char align[4096 * 3];
 };
 
 static user32_mem_t mem;
+static bool touch_initialized = false;
 
 void push_window_message(uint32_t msg, uint32_t lparam, uint32_t rparam)
 {
-    if (mem.data.message_count == 512) return;
+    if (mem.data.message_count == 512)
+        return;
 
-    uint32_t idx = mem.data.message_count++;
+    uint32_t idx = mem.data.message_count;
     mem.data.messages[idx].hwnd = 1;
     mem.data.messages[idx].msg = msg;
     mem.data.messages[idx].lparam = lparam;
     mem.data.messages[idx].rparam = rparam;
+    mem.data.message_count++;
+}
+
+void push_touch(int type, float x, float y)
+{
+    if (!touch_initialized || mem.data.touch_msg_count == 32)
+        return;
+
+    uint32_t idx = mem.data.touch_msg_count;
+    mem.data.touch_messages[idx].type = type;
+    mem.data.touch_messages[idx].x = x;
+    mem.data.touch_messages[idx].y = y;
+    mem.data.touch_msg_count++;
 }
 
 static void cb_user32_PeekMessageW(uc_engine *uc, uint32_t esp)
@@ -192,7 +200,6 @@ static void cb_user32_GetMenuItemInfoA(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
-
 
 static void cb_user32_GetMenuItemInfoW(uc_engine *uc, uint32_t esp)
 {
@@ -389,8 +396,10 @@ static void cb_user32_CreateWindowExW(uc_engine *uc, uint32_t esp)
     {
         auto name = to_utf8string(read_u16string(uc, name_buf));
         sapp_set_window_title(name.c_str());
-        push_window_message(1, 0, 0);
     }
+
+    push_window_message(1, 0, 0);
+    touch_initialized = true;
 
     esp += 52;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -525,6 +534,9 @@ void install_user32_exports(uc_engine *uc)
     // mem.data.wndproc_addr = add_syscall(uc, thunk_cbs.size(), cb_test);
     mem.data.wndproc_addr = 0;
     mem.data.message_count = 0;
+    mem.data.touch_start_proc = 0x4b2490;
+    mem.data.touch_move_proc = 0x4b24f0;
+    mem.data.touch_end_proc = 0x4b2540;
     uc_assert(uc_mem_map_ptr(uc, user_mem_base, align_address(sizeof(user32_mem_t)), UC_PROT_READ | UC_PROT_WRITE, &mem));
 
     // Export PeekMessageW_ex = {"PeekMessageW", cb_user32_PeekMessageW};

@@ -9,12 +9,30 @@
 #include "common.h"
 #include "exports.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 void logf(const char *fmt, ...)
 {
     va_list list;
     va_start(list, fmt);
+#if defined(__ANDROID__)
+    __android_log_vprint(ANDROID_LOG_DEBUG, "KeroLoader2", fmt, list);
+#else
     vprintf(fmt, list);
+#endif
     va_end(list);
+}
+
+uint32_t get_ticks()
+{
+    struct timespec ts;
+    unsigned tck = 0U;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    tck = ts.tv_nsec / 1000000;
+    tck += ts.tv_sec * 1000;
+    return tck;
 }
 
 #pragma pack(push, 1)
@@ -119,7 +137,8 @@ uint32_t stack_size = 0x100000;
 uint32_t jit_last = jit_base;
 uint32_t jit_size = 0;
 
-bool emu_nointerrupt = false;
+bool emu_nointerrupt = true;
+uint32_t emu_sleep = 0;
 uint32_t emu_spinlock_thunk = 0;
 uint32_t emu_spinlock_lock = 0xf0000ff8;
 
@@ -503,10 +522,11 @@ static bool hook_segfault(uc_engine *uc, uc_mem_type type,
     thread->save_regs(uc);
 
     logf("Access Violation at %#010x [addr=%#010lx, size=%#010x, value=%#010lx]\n", thread->eip, address, size, value);
-    // thread->print_stack(uc);
-    // thread->print_regs();
+    thread->print_stack(uc);
+    thread->print_regs();
 
     uc_emu_stop(uc);
+    emu_nointerrupt = false;
     emu_failed = true;
 
     return false;
@@ -520,23 +540,35 @@ static bool hook_interrupt(uc_engine *uc, uint32_t int_num, void *user_data)
     {
     case 0: // division by zero
         logf("Division by zero\n");
+        uc_emu_stop(uc);
+        emu_failed = true;
         return false;
     case 1: // debug
         return true;
     case 3: // breakpoint
         logf("Breakpoint hit\n");
+        emu_nointerrupt = false;
+        uc_emu_stop(uc);
         return true;
     case 6: // invalid cpu opcode
         logf("Invalid CPU opcode\n");
+        uc_emu_stop(uc);
+        emu_failed = true;
         return false;
     case 0x0d: // GPF
         logf("General protection fault\n");
+        uc_emu_stop(uc);
+        emu_failed = true;
         return false;
     case 0x0e: // page fault
         logf("Page fault\n");
+        uc_emu_stop(uc);
+        emu_failed = true;
         return false;
     case 0x10: // fp exception
         logf("Floating point exception\n");
+        uc_emu_stop(uc);
+        emu_failed = true;
         return false;
     case 0x55: // emulator function call
     {
@@ -573,9 +605,11 @@ static bool hook_interrupt(uc_engine *uc, uint32_t int_num, void *user_data)
             name = unresolved_imports[index];
         }
 
-        logf("Reached unresolved function: %s (called from %#010x)\n", name.c_str(), eip - 6);
         uc_emu_stop(uc);
         emu_failed = true;
+        curr_thread_ref->print_stack(uc);
+        curr_thread_ref->print_regs();
+        logf("Reached unresolved function: %s (called from %#010x)\n", name.c_str(), eip - 6);
 
         return true;
     }
@@ -605,10 +639,24 @@ void emu_loop()
     if (emu_failed)
         return;
 
+    static int one = 1;
+    uc_assert(uc_mem_write(uc, 0x4f0638, &one, 4));
+
     do
     {
+        if (emu_sleep != 0)
+        {
+            while (get_ticks() < emu_sleep)
+            {
+                usleep(1000);
+            }
+
+            emu_sleep = 0;
+        }
+
+        // logf("tick: %d\n", tick++);
         uc_assert(uc_reg_read(uc, UC_X86_REG_EIP, &curr_thread_ref->eip));
-        uc_err err = uc_emu_start(uc, curr_thread_ref->eip, 0, 10000, 500000);
+        uc_err err = uc_emu_start(uc, curr_thread_ref->eip, 0, 0, 0);
         if (err != UC_ERR_OK)
         {
             logf("Emulation error: %s (%u)\n", uc_strerror(err), err);
@@ -660,7 +708,7 @@ int emu_init()
     {
         install_exports(uc);
         auto dll_pe = load_pe(uc, "msvcrt.dll");
-        pe = load_pe(uc, "KeroBlasterPLAYISM.exe");
+        pe = load_pe(uc, "KeroBlaster.exe");
 
         uc_hook segfault;
         uc_hook interrupt;
@@ -682,7 +730,7 @@ int emu_init()
         uint32_t program_entry = pe->peHeader.nt.OptionalHeader.ImageBase + pe->peHeader.nt.OptionalHeader.AddressOfEntryPoint;
         uint32_t param;
         main_thread->eip = dll_entry;
-        main_thread->esp = stack_base + stack_size - 0x20;
+        main_thread->esp = stack_base + stack_size - 0x40;
         main_thread->ebp = 0;
         main_thread->restore_regs(uc);
 
@@ -753,8 +801,11 @@ int emu_init()
 
         uc_assert(uc_hook_add(uc, &segfault, UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, (void *)hook_segfault, main_thread, 1, 0), "Failed to register segfault hook");
         uc_assert(uc_hook_add(uc, &interrupt, UC_HOOK_INTR, (void *)hook_interrupt, main_thread, 1, 0), "Failed to register interrupt hook");
-        // uc_assert(uc_hook_add(uc, &trace, UC_HOOK_CODE, (void *)hook_trace, main_thread, 0x48e000, 0x48f700), "Failed to register trace hook");
+        // uc_assert(uc_hook_add(uc, &trace, UC_HOOK_CODE, (void *)hook_trace, main_thread, 0x400000, 0x600000), "Failed to register trace hook");
         // printf("%s\n", export_log.c_str());
+
+        static uint16_t intMode = 0x101;
+        uc_assert(uc_mem_write(uc, 0x4c2747, &intMode, 2));
     }
     catch (std::exception &e)
     {

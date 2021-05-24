@@ -1,6 +1,11 @@
 #include <cstdlib>
 #include <clocale>
 #include <locale>
+#include <filesystem>
+#include <unistd.h>
+#if defined(__ANDROID__)
+#include <android/native_activity.h>
+#endif
 
 #include "sokol_pipeline.h"
 
@@ -39,14 +44,43 @@ void init(void)
     state.deflt.pass_action = pass_action;
     sg_pipeline_desc pdesc = {
         .depth = {
-            .compare = SG_COMPAREFUNC_LESS_EQUAL,
-            .write_enabled = true,
+            //.compare = SG_COMPAREFUNC_LESS_EQUAL,
+            .write_enabled = false,
         },
-        .cull_mode = SG_CULLMODE_BACK,
+        .cull_mode = SG_CULLMODE_NONE,
     };
+    pdesc.colors[0].blend = (sg_blend_state){
+        .enabled = true,
+        .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+        .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA};
     state.deflt.pip = sgl_make_pipeline(&pdesc);
-
     ImGui::GetIO().IniFilename = nullptr;
+    auto style = ImGui::GetStyle();
+    style.FramePadding = ImVec2(4.0, 4.0);
+
+#if defined(__ANDROID__)
+    auto activity = reinterpret_cast<const ANativeActivity *>(sapp_android_get_native_activity());
+    chdir(activity->internalDataPath);
+    logf("path: %s\n", activity->internalDataPath);
+#endif
+    bool steam_api_checksum_matches = true;
+
+    strcpy(msgbox_title_txt, "KeroLoader2 initialization error");
+
+    if (std::filesystem::exists("./steam_api.cdx") || std::filesystem::exists("./steam_emu.ini") || !steam_api_checksum_matches) {
+        strcpy(msgbox_message_txt, "Cracked version detected. Please use a legit copy of the game copied from your Steam installation.");
+        return;
+    }
+
+    if (!std::filesystem::exists("./KeroBlaster.exe")) {
+        strcpy(msgbox_message_txt, "KeroBlaster.exe is missing or incompatible. Please copy files from latest Steam release in order to play.");
+        return;
+    }
+
+    if (!std::filesystem::exists("./msvcrt.dll")) {
+        strcpy(msgbox_message_txt, "msvcrt.dll is missing. Grab a 32-bit version somewhere from internet or from SysWoW64 folder from your Windows installation.");
+        return;
+    }
 
     int code = emu_init();
     if (code != 0)
@@ -56,6 +90,10 @@ void init(void)
 }
 
 extern void test_draw();
+extern uint32_t get_ticks();
+
+extern uint32_t emu_sleep;
+extern bool emu_nointerrupt;
 
 void frame(void)
 {
@@ -63,13 +101,18 @@ void frame(void)
     const int height = sapp_height();
     const double delta_time = stm_sec(stm_laptime(&last_time));
 
+    if (emu_sleep != 0)
+    {
+        if (get_ticks() >= emu_sleep)
+            emu_sleep = 0;
+    }
+
     simgui_new_frame(width, height, delta_time);
     sg_begin_default_pass(&pass_action, width, height);
 
-    //logf("emu loop %s %s\n", msgbox_message_txt, msgbox_title_txt);
     sgl_defaults();
     sgl_load_pipeline(state.deflt.pip);
-    emu_loop();
+
     sgl_draw();
 
     if (msgbox_message_txt[0])
@@ -90,9 +133,11 @@ void frame(void)
         }
 
         ImGui::End();
+    } else {
+        emu_loop();
+        emu_nointerrupt = true;
     }
 
-    test_draw();
     simgui_render();
     sg_end_pass();
     sg_commit();
@@ -104,9 +149,101 @@ void cleanup(void)
     sg_shutdown();
 }
 
+static int to_vk(sapp_keycode code)
+{
+    switch (code)
+    {
+    case SAPP_KEYCODE_ESCAPE:
+        return 0x1b;
+    case SAPP_KEYCODE_LEFT:
+        return 0x25;
+    case SAPP_KEYCODE_UP:
+        return 0x26;
+    case SAPP_KEYCODE_RIGHT:
+        return 0x27;
+    case SAPP_KEYCODE_DOWN:
+        return 0x28;
+    case SAPP_KEYCODE_A:
+        return 0x41;
+    case SAPP_KEYCODE_S:
+        return 0x53;
+    case SAPP_KEYCODE_X:
+        return 0x58;
+    case SAPP_KEYCODE_Z:
+        return 0x5a;
+    default:
+        return 0;
+    }
+}
+
+extern void push_window_message(uint32_t msg, uint32_t lparam, uint32_t rparam);
+extern void push_touch(int type, float x, float y);
+
 void input(const sapp_event *event)
 {
-    simgui_handle_event(event);
+    if (simgui_handle_event(event))
+        return;
+
+    if (event->type == SAPP_EVENTTYPE_KEY_DOWN)
+    {
+        int key = to_vk(event->key_code);
+        if (key != 0)
+            push_window_message(0x100, key, 0);
+    }
+    else if (event->type == SAPP_EVENTTYPE_KEY_UP)
+    {
+        int key = to_vk(event->key_code);
+        if (key != 0)
+            push_window_message(0x101, key, 0);
+    }
+    else if (event->type == SAPP_EVENTTYPE_TOUCHES_BEGAN)
+    {
+        for (int i = 0; i < event->num_touches; i++)
+        {
+            if (event->touches[i].changed)
+            {
+                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f;
+                float touch_y = event->touches[i].pos_y / sapp_heightf() * 320.0f;
+                push_touch(0, touch_x, touch_y);
+            }
+        }
+    }
+    else if (event->type == SAPP_EVENTTYPE_TOUCHES_MOVED)
+    {
+        for (int i = 0; i < event->num_touches; i++)
+        {
+            if (event->touches[i].changed)
+            {
+                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f;
+                float touch_y = event->touches[i].pos_y / sapp_heightf() * 320.0f;
+                push_touch(1, touch_x, touch_y);
+            }
+        }
+    }
+    else if (event->type == SAPP_EVENTTYPE_TOUCHES_CANCELLED || event->type == SAPP_EVENTTYPE_TOUCHES_ENDED)
+    {
+        for (int i = 0; i < event->num_touches; i++)
+        {
+            if (event->touches[i].changed)
+            {
+                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f;
+                float touch_y = event->touches[i].pos_y / sapp_heightf() * 320.0f;
+                push_touch(2, touch_x, touch_y);
+            }
+        }
+    }
+    else if (event->type == SAPP_EVENTTYPE_MOUSE_DOWN)
+    {
+        push_touch(0, event->mouse_x, event->mouse_y);
+    }
+    else if (event->type == SAPP_EVENTTYPE_MOUSE_MOVE)
+    {
+        push_touch(1, event->mouse_x, event->mouse_y);
+    }
+    else if (event->type == SAPP_EVENTTYPE_MOUSE_UP)
+    {
+        push_touch(2, event->mouse_x, event->mouse_y);
+    }
 }
 
 sapp_desc sokol_main(int argc, char *argv[])
@@ -122,8 +259,9 @@ sapp_desc sokol_main(int argc, char *argv[])
     desc.frame_cb = frame;
     desc.cleanup_cb = cleanup;
     desc.event_cb = input;
-    desc.width = 800;
-    desc.height = 480;
+    desc.width = 570;
+    desc.height = 320;
+    desc.high_dpi = false;
     desc.gl_force_gles2 = true;
     desc.window_title = "KeroLoader";
     desc.ios_keyboard_resizes_canvas = false;

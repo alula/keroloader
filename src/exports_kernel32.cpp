@@ -503,7 +503,7 @@ static void cb_kernel32_CreateFileA(uc_engine *uc, uint32_t esp)
             const auto path = to_unix_path(u16path);
             FILE *handle = nullptr;
 
-            logf("CreateFileA(%s, %#010x, %#010x)\n", path.c_str(), dw_desired_access, dw_creation_disposition);
+            // logf("CreateFileA(%s, %#010x, %#010x)\n", path.c_str(), dw_desired_access, dw_creation_disposition);
 
             if (dw_desired_access == 0xc0000000 && dw_creation_disposition == 4)
             {
@@ -1040,9 +1040,9 @@ static void cb_kernel32_MultiByteToWideChar(uc_engine *uc, uint32_t esp)
     uint32_t codepage;
     uint32_t dw_flags;
     uint32_t mb_string_buf; // wchar_t*
-    uint32_t mb_string_len;
+    int mb_string_len;
     uint32_t wide_string_buf; // char*
-    uint32_t wide_string_len;
+    int wide_string_len;
 
     uint32_t target_len = 0;
     uint32_t ret = 0;
@@ -1062,19 +1062,30 @@ static void cb_kernel32_MultiByteToWideChar(uc_engine *uc, uint32_t esp)
         if (mb_string_len > 0)
         {
             if (mb_string_len < mb.size())
+            {
+                // logf("mb_string_len < size %d %d\n", mb_string_len, mb.size());
                 mb.resize(mb_string_len);
+            }
         }
+        // printf("%s\n", mb.c_str());
 
         auto encoded = to_u16string(mb);
         target_len = encoded.size();
+        // logf("target_len = %d\n", target_len);
+
+        if (wide_string_len > 0)
+        {
+            if (wide_string_len < target_len)
+                target_len = wide_string_len;
+        }
+        else
+        {
+            if (mb_string_len == -1)
+                ++target_len;
+        }
 
         if (wide_string_len != 0)
-        {
-            if (wide_string_len > target_len)
-                target_len = wide_string_len;
-
-            uc_assert(uc_mem_write(uc, wide_string_buf, encoded.data(), target_len));
-        }
+            uc_assert(uc_mem_write(uc, wide_string_buf, encoded.data(), target_len * 2));
 
         ret = target_len;
     }
@@ -1093,9 +1104,9 @@ static void cb_kernel32_WideCharToMultiByte(uc_engine *uc, uint32_t esp)
     uint32_t codepage;
     uint32_t dw_flags;
     uint32_t wide_string_buf; // wchar_t*
-    uint32_t wide_string_len;
+    int wide_string_len;
     uint32_t mb_string_buf; // char*
-    uint32_t mb_string_len;
+    int mb_string_len;
     uint32_t unknown_character_ptr; // const char*
     uint32_t has_used_unk_char_ptr; // uint32_t*
 
@@ -1257,7 +1268,7 @@ static void cb_kernel32_WriteFile(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 12, &bytes_to_write, 4));
     uc_assert(uc_mem_read(uc, esp + 16, &bytes_written_ptr, 4));
 
-    logf("WriteFile(%#010x, %#010x, %d, %#010x, ???)\n", file_handle, lp_buffer, bytes_to_write, bytes_written_ptr);
+    // logf("WriteFile(%#010x, %#010x, %d, %#010x, ???)\n", file_handle, lp_buffer, bytes_to_write, bytes_written_ptr);
 
     auto handle = file_handles.find(file_handle);
     if (handle != file_handles.end())
@@ -1288,7 +1299,7 @@ static void cb_kernel32_WriteFile(uc_engine *uc, uint32_t esp)
     }
     else
     {
-        logf("invalid handle.\n");
+        // logf("invalid handle.\n");
         ret = 0;
         last_error = ERROR_INVALID_HANDLE;
     }
@@ -1375,7 +1386,7 @@ static void cb_kernel32_SetFilePointer(uc_engine *uc, uint32_t esp)
 
             // if (pos_hi_ptr != 0) uc_assert(uc_mem_write(uc, pos_hi_ptr, &pos_hi, 4));
 
-            logf("SetFilePointer(%#010x, %d, %d) seek to %#010lx\n", file_handle, pos_lo, origin, pos_new);
+            // logf("SetFilePointer(%#010x, %d, %d) seek to %#010lx\n", file_handle, pos_lo, origin, pos_new);
         }
         else
         {
@@ -1471,6 +1482,23 @@ static void cb_kernel32_DeleteCriticalSection(uc_engine *uc, uint32_t esp)
 
     esp += 8;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_TryEnterCriticalSection(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 1;
+    uint32_t lp_crit_section;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &lp_crit_section, 4));
+
+    // no op till we get threading
+    // logf("%#010x EnterCriticalSection(%#010x)\n", return_addr, lp_crit_section);
+
+    esp += 8;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
@@ -2102,6 +2130,28 @@ static void cb_kernel32_GetProcAddress(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static void cb_kernel32_ResumeThread(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 1;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    esp += 8;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_CreateThread(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 2;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    esp += 28;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
 static void cb_kernel32_GetCurrentThreadId(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
@@ -2338,9 +2388,27 @@ static void cb_kernel32_Sleep(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 4, &time, 4));
     esp += 8;
 
-    usleep(time * 1000);
+    // usleep(time * 1000);
+
+    static bool is_pinkhour_143 = false;
+    if (is_pinkhour_143)
+    {
+        uint32_t shit;
+        uc_assert(uc_mem_read(uc, 0x527a18, &shit, 4));
+        printf("music shit: %#010x\n", shit);
+        if (shit != 0)
+        {
+            char t = 1;
+            uc_assert(uc_mem_write(uc, shit + 0, &t, 1));
+            t = 0;
+            uc_assert(uc_mem_write(uc, shit + 1, &t, 1));
+            uc_assert(uc_mem_write(uc, shit + 2, &t, 1));
+        }
+    }
 
     // logf("%#010x Sleep(%d)\n", return_addr, time);
+    uc_emu_stop(uc);
+    emu_sleep = get_ticks() + time;
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
@@ -2459,13 +2527,31 @@ static void cb_kernel32_CreateFileMappingW(uc_engine *uc, uint32_t esp)
 static void cb_kernel32_SetPriorityClass(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
-    uint32_t process_handle;
-    uint32_t priority;
+    // uint32_t process_handle;
+    // uint32_t priority;
     uint32_t ret = 0;
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
-    uc_assert(uc_mem_read(uc, esp + 4, &process_handle, 4));
-    uc_assert(uc_mem_read(uc, esp + 8, &priority, 1));
+    // uc_assert(uc_mem_read(uc, esp + 4, &process_handle, 4));
+    // uc_assert(uc_mem_read(uc, esp + 8, &priority, 1));
+
+    esp += 12;
+
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+static void cb_kernel32_SetThreadPriority(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    // uint32_t thread_handle;
+    // uint32_t priority;
+    uint32_t ret = 0;
+
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    // uc_assert(uc_mem_read(uc, esp + 4, &thread_handle, 4));
+    // uc_assert(uc_mem_read(uc, esp + 8, &priority, 1));
 
     esp += 12;
 
@@ -2657,6 +2743,9 @@ static void cb_kernel32_GetLocalTime(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static uint8_t kernel32_GetFileVersionInfoSize_code[] = {0x31, 0xC0, 0xC2, 0x08, 0x00};
+static uint8_t kernel32_VerQueryValue_code[] = {0x31, 0xC0, 0xC2, 0x10, 0x00};
+
 void install_kernel32_exports(uc_engine *uc)
 {
     {
@@ -2675,6 +2764,18 @@ void install_kernel32_exports(uc_engine *uc)
 
     file_handles[STDIN_HANDLE_VALUE] = stdin;
     file_handles[STDOUT_HANDLE_VALUE] = stdout;
+
+    Export GetFileVersionInfoSizeA_ex = {"GetFileVersionInfoSizeA", nullptr, kernel32_GetFileVersionInfoSize_code, sizeof(kernel32_GetFileVersionInfoSize_code)};
+    exports["GetFileVersionInfoSizeA"] = GetFileVersionInfoSizeA_ex;
+
+    Export GetFileVersionInfoSizeW_ex = {"GetFileVersionInfoSizeW", nullptr, kernel32_GetFileVersionInfoSize_code, sizeof(kernel32_GetFileVersionInfoSize_code)};
+    exports["GetFileVersionInfoSizeW"] = GetFileVersionInfoSizeW_ex;
+
+    Export VerQueryValueA_ex = {"VerQueryValueA", nullptr, kernel32_VerQueryValue_code, sizeof(kernel32_VerQueryValue_code)};
+    exports["VerQueryValueA"] = VerQueryValueA_ex;
+
+    Export VerQueryValueW_ex = {"VerQueryValueW", nullptr, kernel32_VerQueryValue_code, sizeof(kernel32_VerQueryValue_code)};
+    exports["VerQueryValueW"] = VerQueryValueW_ex;
 
     Export FindFirstFileA_ex = {"FindFirstFileA", cb_kernel32_FindFirstFileA};
     exports["FindFirstFileA"] = FindFirstFileA_ex;
@@ -2775,6 +2876,9 @@ void install_kernel32_exports(uc_engine *uc)
     Export DeleteCriticalSection_ex = {"DeleteCriticalSection", cb_kernel32_DeleteCriticalSection};
     exports["DeleteCriticalSection"] = DeleteCriticalSection_ex;
 
+    Export TryEnterCriticalSection_ex = {"TryEnterCriticalSection", cb_kernel32_TryEnterCriticalSection};
+    exports["TryEnterCriticalSection"] = TryEnterCriticalSection_ex;
+
     Export EnterCriticalSection_ex = {"EnterCriticalSection", cb_kernel32_EnterCriticalSection};
     exports["EnterCriticalSection"] = EnterCriticalSection_ex;
 
@@ -2856,6 +2960,12 @@ void install_kernel32_exports(uc_engine *uc)
     Export GetProcAddress_ex = {"GetProcAddress", cb_kernel32_GetProcAddress};
     exports["GetProcAddress"] = GetProcAddress_ex;
 
+    Export ResumeThread_ex = {"ResumeThread", cb_kernel32_ResumeThread};
+    exports["ResumeThread"] = ResumeThread_ex;
+
+    Export CreateThread_ex = {"CreateThread", cb_kernel32_CreateThread};
+    exports["CreateThread"] = CreateThread_ex;
+
     Export GetCurrentThreadId_ex = {"GetCurrentThreadId", cb_kernel32_GetCurrentThreadId};
     exports["GetCurrentThreadId"] = GetCurrentThreadId_ex;
 
@@ -2909,6 +3019,9 @@ void install_kernel32_exports(uc_engine *uc)
 
     Export SetPriorityClass_ex = {"SetPriorityClass", cb_kernel32_SetPriorityClass};
     exports["SetPriorityClass"] = SetPriorityClass_ex;
+
+    Export SetThreadPriority_ex = {"SetThreadPriority", cb_kernel32_SetThreadPriority};
+    exports["SetThreadPriority"] = SetThreadPriority_ex;
 
     Export GetACP_ex = {"GetACP", cb_kernel32_GetACP};
     exports["GetACP"] = GetACP_ex;

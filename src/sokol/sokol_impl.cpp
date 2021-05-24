@@ -1,5 +1,9 @@
 #define SOKOL_IMPL
+#ifdef __ANDROID__
+#define SOKOL_GLES3
+#else
 #define SOKOL_GLCORE33
+#endif
 
 #include "sokol_app.h"
 #include "sokol_gfx.h"

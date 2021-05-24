@@ -70,6 +70,7 @@ extern uint32_t stack_base;
 extern uint32_t stack_size;
 extern uint32_t emu_spinlock_thunk;
 extern uint32_t emu_spinlock_lock;
+extern uint32_t emu_sleep;
 extern bool emu_failed;
 extern bool emu_nointerrupt;
 
@@ -98,6 +99,8 @@ extern std::string read_string(uc_engine *uc, uint32_t address);
 
 extern void *kernel32_host_malloc(uintptr_t *emu_addr, size_t size);
 extern void kernel32_host_free(void *mem);
+
+extern uint32_t get_ticks();
 
 static inline constexpr uint32_t align_address(uint32_t addr, uint32_t alignment = 0x1000)
 {

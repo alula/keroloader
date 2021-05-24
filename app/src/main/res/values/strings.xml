@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">KeroLoader2</string>
+    <string name="document_provider_name">KeroLoader data</string>
+</resources>

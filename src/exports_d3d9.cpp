@@ -392,6 +392,20 @@ static void cb_d3d9_IDirect3DDevice9_TestCooperativeLevel(uc_engine *uc, uint32_
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static void cb_d3d9_IDirect3DDevice9_SetFVF(uc_engine *uc, uint32_t esp)
+{
+    uint32_t buffer_info;
+    uint32_t ret = D3D_OK;
+    uint32_t return_addr;
+
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    esp += 12;
+
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
 static bool sgl_initialized = false;
 
 static void cb_d3d9_IDirect3DDevice9_BeginScene(uc_engine *uc, uint32_t esp)
@@ -404,8 +418,8 @@ static void cb_d3d9_IDirect3DDevice9_BeginScene(uc_engine *uc, uint32_t esp)
     if (!sgl_initialized)
     {
         sgl_initialized = true;
-        sgl_enable_texture();
-        sgl_ortho(0.0, 800.0, 480.0, 0.0, -1000.0, 1000.0);
+        float width = sapp_widthf() / sapp_heightf() * 320.0f;
+        sgl_ortho(0.0, width, 320.0f, 0.0, -1000.0, 1000.0);
     }
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
@@ -418,13 +432,62 @@ static void cb_d3d9_IDirect3DDevice9_BeginScene(uc_engine *uc, uint32_t esp)
 
 static void cb_d3d9_IDirect3DDevice9_EndScene(uc_engine *uc, uint32_t esp)
 {
-    uint32_t buffer_info;
     uint32_t ret = D3D_OK;
     uint32_t return_addr;
-    emu_nointerrupt = false;
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
     esp += 8;
+
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
+struct KBVertexUntextured
+{
+    float x;
+    float y;
+    float z;
+    float w;
+    uint32_t color;
+};
+
+static void cb_d3d9_IDirect3DDevice9_DrawPrimitiveUP(uc_engine *uc, uint32_t esp)
+{
+    uint32_t primitive_type;
+    uint32_t primitive_count;
+    uint32_t data_ptr;
+    uint32_t stride;
+    uint32_t ret = D3D_OK;
+    uint32_t return_addr;
+    KBVertexUntextured vert;
+
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &primitive_type, 4));
+    uc_assert(uc_mem_read(uc, esp + 12, &primitive_count, 4));
+    uc_assert(uc_mem_read(uc, esp + 16, &data_ptr, 4));
+    uc_assert(uc_mem_read(uc, esp + 20, &stride, 4));
+
+    if (primitive_type == 5)
+    {
+        sgl_disable_texture();
+        sgl_begin_triangle_strip();
+        primitive_count += 2;
+        //for (int i = primitive_count; i > 0; --i)
+        for (int i = 0; i < primitive_count; i++)
+        {
+            uint32_t addr = data_ptr + i * stride;
+            uc_assert(uc_mem_read(uc, addr, &vert, sizeof(KBVertexUntextured)));
+            uint32_t color = vert.color & 0xff00ff00;
+            color |= (vert.color & 0xff) << 16;
+            color |= (vert.color >> 16) & 0xff;
+            // printf("%d %d %d %#010x %f %f %f %f\n", primitive_type, i, primitive_count, vert.color, vert.x, vert.y, vert.z, vert.w);
+            sgl_v3f_c1i(vert.x, vert.y, vert.z, color);
+        }
+        sgl_end();
+    }
+
+    esp += 24;
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
@@ -436,16 +499,18 @@ static void cb_d3d9_IDirect3DDevice9_Present(uc_engine *uc, uint32_t esp)
     uint32_t buffer_info;
     uint32_t ret = D3D_OK;
     uint32_t return_addr;
-    emu_nointerrupt = false;
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
-    esp += 20;
+    esp += 24;
     if (sgl_initialized)
     {
         sgl_initialized = false;
     }
+    // logf("present\n");
 
     uc_assert(uc_emu_stop(uc));
+    emu_nointerrupt = false;
+
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
@@ -528,7 +593,7 @@ static void cb_d3d9_IDirect3D9Texture_Release(uc_engine *uc, uint32_t esp)
     if (self != 0 && tex->used)
     {
         tex->used = false;
-        sg_destroy_image(tex->vtable.image);
+        //sg_destroy_image(tex->vtable.image);
         tex->vtable.image.id = 0;
 
         if (tex->vtable.hostbuf != nullptr)
@@ -631,6 +696,7 @@ static void cb_d3d9_ID3DXSprite9_Draw(uc_engine *uc, uint32_t esp)
 
     if (tex->used)
     {
+        sgl_enable_texture();
         sgl_texture(tex->vtable.image);
         sgl_begin_quads();
         sgl_c1i(color);
@@ -848,6 +914,8 @@ void ID3D9DeviceVtable::Init(uc_engine *uc)
     TestCooperativeLevel = add_syscall(uc, thunk_cbs.size(), cb_d3d9_IDirect3DDevice9_TestCooperativeLevel);
     BeginScene = add_syscall(uc, thunk_cbs.size(), cb_d3d9_IDirect3DDevice9_BeginScene);
     EndScene = add_syscall(uc, thunk_cbs.size(), cb_d3d9_IDirect3DDevice9_EndScene);
+    SetFVF = add_syscall(uc, thunk_cbs.size(), cb_d3d9_IDirect3DDevice9_SetFVF);
+    DrawPrimitiveUP = add_syscall(uc, thunk_cbs.size(), cb_d3d9_IDirect3DDevice9_DrawPrimitiveUP);
     Present = add_syscall(uc, thunk_cbs.size(), cb_d3d9_IDirect3DDevice9_Present);
 }
 

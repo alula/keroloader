@@ -1,8 +1,9 @@
 #include <string>
+#include <sstream>
 #include <codecvt>
 #include <locale>
-#include <cuchar>
-#include <cwchar>
+#include "wchar.h"
+#include "uchar.h"
 #include <iomanip>
 #include <unicorn/unicorn.h>
 #include "common.h"
@@ -83,14 +84,16 @@ std::string to_utf8string(std::u16string const &u)
 std::u16string to_u16string(std::string const &u)
 {
     std::u16string out;
-    mbstate_t state;
-    char16_t c;
+    mbstate_t state = {};
+    char16_t c = 0;
     const char *p = u.data();
     const char *end = &*u.end();
-    size_t rc;
+    size_t rc = 0;
 
     while ((rc = mbrtoc16(&c, p, end - p, &state)) != 0)
     {
+        if (*p == 0) break;
+
         if (rc == size_t(-1) || rc == size_t(-2))
         {
             break;
@@ -122,6 +125,8 @@ std::u16string read_u16string(uc_engine *uc, uint32_t address)
         address += 2;
         s += chr;
     }
+    s.reserve(2);
+    s.data()[s.size()] = 0;
 
     return s;
 }
@@ -139,6 +144,8 @@ std::string read_string(uc_engine *uc, uint32_t address)
         s += chr;
         address += 1;
     }
+    s.reserve(2);
+    s.data()[s.size()] = 0;
 
     return s;
 }
