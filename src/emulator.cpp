@@ -3,25 +3,28 @@
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
+#include <algorithm>
 #include "pe-parse/parse.h"
 #include <unicorn/unicorn.h>
 
 #include "common.h"
 #include "exports.h"
+#include "sokol_pipeline.h"
 
 #if defined(__ANDROID__)
 #include <android/log.h>
 #endif
+
+static FILE *log_file = stdout;
 
 void logf(const char *fmt, ...)
 {
     va_list list;
     va_start(list, fmt);
 #if defined(__ANDROID__)
-    __android_log_vprint(ANDROID_LOG_DEBUG, "KeroLoader2", fmt, list);
-#else
-    vprintf(fmt, list);
+    __android_log_vprint(ANDROID_LOG_DEBUG, "KeroMLoader", fmt, list);
 #endif
+    vfprintf(log_file, fmt, list);
     va_end(list);
 }
 
@@ -42,7 +45,6 @@ struct SegmentDescriptor
     {
         struct
         {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
             unsigned short limit0;
             unsigned short base0;
             unsigned char base1;
@@ -56,21 +58,6 @@ struct SegmentDescriptor
             unsigned char db : 1;          /* DB flag */
             unsigned char granularity : 1; /* G flag */
             unsigned char base2;
-#else
-            unsigned char base2;
-            unsigned char granularity : 1; /* G flag */
-            unsigned char db : 1;          /* DB flag */
-            unsigned char is_64_code : 1;  /* L flag */
-            unsigned char avail : 1;
-            unsigned char limit1 : 4;
-            unsigned char present : 1; /* P flag */
-            unsigned char dpl : 2;
-            unsigned char system : 1; /* S flag */
-            unsigned char type : 4;
-            unsigned char base1;
-            unsigned short base0;
-            unsigned short limit0;
-#endif
         };
         uint64_t desc;
     };
@@ -93,25 +80,25 @@ struct TIB32
 
 static void init_descriptor(struct SegmentDescriptor *desc, uint32_t base, uint32_t limit, uint8_t is_code)
 {
-    desc->desc = 0; //clear the descriptor
+    desc->desc = 0; // clear the descriptor
     desc->base0 = base & 0xffff;
     desc->base1 = (base >> 16) & 0xff;
     desc->base2 = base >> 24;
     if (limit > 0xfffff)
     {
-        //need Giant granularity
+        // need Giant granularity
         limit >>= 12;
         desc->granularity = 1;
     }
     desc->limit0 = limit & 0xffff;
     desc->limit1 = limit >> 16;
 
-    //some sane defaults
+    // some sane defaults
     desc->dpl = 3;
     desc->present = 1;
-    desc->db = 1; //32 bit
+    desc->db = 1; // 32 bit
     desc->type = is_code ? 0xb : 3;
-    desc->system = 1; //code or data
+    desc->system = 1; // code or data
 }
 
 uint32_t image_base = 0x00400000;
@@ -132,7 +119,7 @@ uint32_t curr_thread = 0;
 ThreadCtx *curr_thread_ref = nullptr;
 void *heap = nullptr;
 void *stack = nullptr;
-uint32_t heap_size = 32 * 0x100000;
+uint32_t heap_size = 64 * 0x100000;
 uint32_t stack_size = 0x100000;
 uint32_t jit_last = jit_base;
 uint32_t jit_size = 0;
@@ -144,6 +131,7 @@ uint32_t emu_spinlock_lock = 0xf0000ff8;
 
 std::unordered_map<std::string, uint32_t> import_cache;
 std::vector<std::string> unresolved_imports;
+std::vector<std::pair<uint32_t, uint32_t>> pe_ranges;
 static std::string export_log = "";
 
 uint32_t last_error = 0;
@@ -348,6 +336,13 @@ uint32_t add_unresolved_stub(uc_engine *uc, std::string s)
     return push_jitregion(uc, thunk, sizeof(thunk));
 }
 
+struct RelIterData
+{
+    peparse::parsed_pe *pe;
+    uc_engine *uc;
+    int rel_offset;
+};
+
 peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
 {
     logf("Loading file: %s\n", name);
@@ -361,20 +356,98 @@ peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
     auto &nt = pe->peHeader.nt;
     if (nt.FileHeader.Machine != peparse::IMAGE_FILE_MACHINE_I386)
     {
-        throw std::runtime_error("Not an x86 executable.");
+        throw std::runtime_error("Not an i386 executable.");
     }
 
     uint32_t image_header_size = pe->peHeader.dos.e_lfanew + (offsetof(peparse::nt_header_32, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader + (nt.FileHeader.NumberOfSections * sizeof(peparse::image_section_header)));
     uint32_t image_base = nt.OptionalHeader.ImageBase;
-    uc_mem_unmap(uc, image_base, align_address(image_header_size));
-    uc_assert(uc_mem_map(uc, image_base, align_address(image_header_size), UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC), "Failed to map image header section");
-    uc_assert(uc_mem_write(uc, image_base, pe->fileBuffer->buf, image_header_size), "Failed to write image header section");
+    uint32_t end_addr = image_base;
+    bool needs_relocation = false;
+    int reloc_offset = 0;
 
     peparse::IterSec(
         pe, [](void *p, const peparse::VA &sect_base, const std::string &sect_name, const peparse::image_section_header &sect_hdr, const peparse::bounded_buffer *sect_data) -> int
         {
-            auto uc = (uc_engine *)p;
+            uint32_t addr = sect_base + align_address(sect_hdr.Misc.VirtualSize);
+            uint32_t *end_addr = (uint32_t *)p;
+            if (addr > *end_addr)
+            {
+                *end_addr = addr;
+            }
+            
+            return 0; },
+        (void *)&end_addr);
+
+    // Iterate over loaded image bounds and check if none of them clashes with our memory space.
+    // Otherwise find a new base address for the image in 0x00400000-0x20000000 range.
+    // pe_ranges consists of [image_base, end_addr] tuples.
+
+    for (auto &range : pe_ranges)
+    {
+        if (range.first <= image_base && image_base <= range.second)
+        {
+            needs_relocation = true;
+            break;
+        }
+
+        if (range.first <= end_addr && end_addr <= range.second)
+        {
+            needs_relocation = true;
+            break;
+        }
+    }
+
+    if (needs_relocation)
+    {
+        if ((pe->peHeader.nt.OptionalHeader.LoaderFlags & peparse::IMAGE_FILE_RELOCS_STRIPPED) != 0)
+        {
+            throw std::runtime_error("The relocation information of this image is stripped.");
+        }
+
+        // find a new base address
+        for (uint32_t i = 0x00400000; i < 0x20000000; i += 0x1000)
+        {
+
+            if (std::any_of(pe_ranges.begin(), pe_ranges.end(),
+                            [i](const std::pair<uint32_t, uint32_t> &range) -> bool
+                            {
+                                return range.first <= i && i <= range.second;
+                            }))
+            {
+                continue;
+            }
+
+            reloc_offset = (int)(image_base - i);
+            break;
+        }
+
+        if (reloc_offset == 0)
+        {
+            throw std::runtime_error("Failed to find a free address for the PE image.");
+        }
+
+        image_base += reloc_offset;
+        end_addr += reloc_offset;
+        logf("Relocating PE to %#010x\n", image_base);
+    }
+
+    uc_mem_unmap(uc, image_base, align_address(image_header_size));
+    uc_assert(uc_mem_map(uc, image_base, align_address(image_header_size), UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC), "Failed to map image header section");
+    uc_assert(uc_mem_write(uc, image_base, pe->fileBuffer->buf, image_header_size), "Failed to write image header section");
+
+    pe_ranges.push_back(std::make_pair(image_base, end_addr));
+
+    const RelIterData iter_data = {pe, uc, reloc_offset};
+
+    peparse::IterSec(
+        pe, [](void *p, const peparse::VA &_sect_base, const std::string &sect_name, const peparse::image_section_header &sect_hdr, const peparse::bounded_buffer *sect_data) -> int
+        {
+            auto iter_data = reinterpret_cast<RelIterData*>(p);
+            auto uc = iter_data->uc;
+            auto rel_offset = iter_data->rel_offset;
             auto addr = sect_data->buf;
+            auto sect_base = _sect_base + rel_offset;
+
             char protflags[4] = "---";
             uint32_t perms = 0;
 
@@ -414,14 +487,73 @@ peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
                 uc_assert(uc_mem_write(uc, sect_base, sect_data->buf, sect_data->bufLen), "Failed to write section");
             }
 
-            return 0;
-        },
-        uc);
+            return 0; },
+        (void *)&iter_data);
+
+    if (needs_relocation)
+    {
+        peparse::IterRelocs(
+            pe, [](void *p, const peparse::VA &shifted_addr, const peparse::reloc_type &rel_type)
+            {
+            auto iter_data = reinterpret_cast<RelIterData *>(p);
+            auto pe = iter_data->pe;
+            auto rel_offset = iter_data->rel_offset;
+
+            // logf("Relocating %#010x to %#010x\n", shifted_addr, shifted_addr + rel_offset);
+            switch (rel_type) {
+                case peparse::RELOC_ABSOLUTE:
+                    break;
+                case peparse::RELOC_HIGH: {
+                    auto addr = shifted_addr + rel_offset;
+                    uint16_t val = 0;
+                    uint16_t offset_hi = (uint16_t)(((uint32_t)rel_offset & 0xffff0000u) >> 16u);
+                    uc_assert(uc_mem_read(iter_data->uc, addr, &val, sizeof(val)), "Failed to read relocation value");
+                    val += offset_hi;
+                    uc_assert(uc_mem_write(iter_data->uc, addr, &val, sizeof(val)), "Failed to write relocation value");
+                    break;
+                }
+                case peparse::RELOC_LOW: {
+                    auto addr = shifted_addr + rel_offset;
+                    uint16_t val = 0;
+                    uint16_t offset_lo = (uint16_t)((uint32_t)rel_offset & 0xffffu);
+                    uc_assert(uc_mem_read(iter_data->uc, addr, &val, sizeof(val)), "Failed to read relocation value");
+                    val += offset_lo;
+                    uc_assert(uc_mem_write(iter_data->uc, addr, &val, sizeof(val)), "Failed to write relocation value");
+                    break;
+                }
+                case peparse::RELOC_HIGHLOW: {
+                    auto addr = shifted_addr + rel_offset;
+                    uint32_t val = 0;
+                    uc_assert(uc_mem_read(iter_data->uc, addr, &val, sizeof(val)), "Failed to read relocation value");
+                    val += rel_offset;
+                    uc_assert(uc_mem_write(iter_data->uc, addr, &val, sizeof(val)), "Failed to write relocation value");
+                    break;
+                }
+                case peparse::RELOC_DIR64: {
+                    auto addr = shifted_addr + rel_offset;
+                    uint64_t val = 0;
+                    uc_assert(uc_mem_read(iter_data->uc, addr, &val, sizeof(val)), "Failed to read relocation value");
+                    val += rel_offset;
+                    uc_assert(uc_mem_write(iter_data->uc, addr, &val, sizeof(val)), "Failed to write relocation value");
+                    break;
+                }
+                default: {
+                    std::string message = "Unsupported relocation type: " + rel_type;
+                    uc_assert(UC_ERR_MAP, message);
+                    break;
+                }
+            }
+
+            return 0; },
+            (void *)&iter_data);
+    }
 
     peparse::IterExpVA(
         pe, [](void *p, const peparse::VA &export_addr, const std::string &mod_name, const std::string &sym_name) -> int
         {
-            uint32_t addr = (uint32_t)export_addr;
+            auto iter_data = reinterpret_cast<RelIterData*>(p);
+
+            uint32_t addr = (uint32_t)export_addr + iter_data->rel_offset;
             auto cached = import_cache.find(sym_name);
             if (cached == import_cache.end() && exports.find(sym_name) == exports.end())
             {
@@ -440,15 +572,16 @@ peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
                 import_cache[sym2] = addr;
             }
 
-            return 0;
-        },
-        uc);
+            return 0; },
+        (void *)&iter_data);
 
     printf("Resolving imports:\n");
     peparse::IterImpVAString(
-        pe, [](void *p, const peparse::VA &import_addr, const std::string &mod_name, const std::string &sym_name) -> int
+        pe, [](void *p, const peparse::VA &_import_addr, const std::string &mod_name, const std::string &sym_name) -> int
         {
-            auto uc = (uc_engine *)p;
+            auto iter_data = reinterpret_cast<RelIterData*>(p);
+            auto uc = iter_data->uc;
+            auto import_addr = _import_addr + iter_data->rel_offset;
             char buff[512] = "";
 
             logf("Import: %p - %s %s\n", import_addr, mod_name.c_str(), sym_name.c_str());
@@ -508,9 +641,8 @@ peparse::parsed_pe *load_pe(uc_engine *uc, const char *name)
                 export_log += buff;
             }
 
-            return 0;
-        },
-        uc);
+            return 0; },
+        (void *)&iter_data);
 
     return pe;
 }
@@ -584,11 +716,11 @@ static bool hook_interrupt(uc_engine *uc, uint32_t int_num, void *user_data)
             thunk_cbs[call_id](uc, esp);
         }
 
-        //logf("call id: %#010x\n", call_id);
+        // logf("call id: %#010x\n", call_id);
 
         return true;
     }
-    case 0x56: // unresolved link breakpoint
+    case 0x56: // unresolved link trap
     {
         uint32_t esp;
         uint32_t eip;
@@ -639,9 +771,6 @@ void emu_loop()
     if (emu_failed)
         return;
 
-    static int one = 1;
-    uc_assert(uc_mem_write(uc, 0x4f0638, &one, 4));
-
     do
     {
         if (emu_sleep != 0)
@@ -673,6 +802,12 @@ void emu_loop()
 int emu_init()
 {
     uc_err err;
+
+#if defined(__ANDROID__)
+    log_file = fopen("keroloader.log", "w+");
+    if (!log_file)
+        log_file = stdout;
+#endif
 
     logf("Initializing CPU emulator...\n");
     err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc);
@@ -706,9 +841,45 @@ int emu_init()
 
     try
     {
+        // todo:
+        // - todo use dependencies from PE headers properly and use relocations
+        // - put this small stub to call the dll entry points
+        // // eax = pointer to list of entry points
+        // // struct DLLEntryPoint {
+        // //    uint32_t address;
+        // //    uint32_t handle;
+        // // };
+        // mov esi, eax
+        // push eax
+        // _loop:
+        // mov eax, [esi]
+        // cmp eax, eax
+        // jz _end
+
+        // push esi
+        // // lpReserved
+        // mov eax, 1
+        // push eax
+        // // DLL_PROCESS_ATTACH
+        // mov eax, 0
+        // push eax
+        // // hInst
+        // mov eax, [esi + 4]
+        // // call DllMain
+        // push eax
+        // mov eax, [esi]
+        // call eax
+        // pop esi
+        // add esi, 8
+        // jmp _loop
+
+        // _end:
+        // int 0x80
+
         install_exports(uc);
-        auto dll_pe = load_pe(uc, "msvcrt.dll");
-        pe = load_pe(uc, "KeroBlaster.exe");
+        auto dll_pe = load_pe(uc, "msvcr120.dll");
+        auto dll2_pe = load_pe(uc, "msvcp120.dll");
+        pe = load_pe(uc, "test.exe");
 
         uc_hook segfault;
         uc_hook interrupt;
@@ -727,6 +898,7 @@ int emu_init()
         curr_thread_ref = main_thread;
 
         uint32_t dll_entry = dll_pe->peHeader.nt.OptionalHeader.ImageBase + dll_pe->peHeader.nt.OptionalHeader.AddressOfEntryPoint;
+        uint32_t dll2_entry = dll2_pe->peHeader.nt.OptionalHeader.ImageBase + dll2_pe->peHeader.nt.OptionalHeader.AddressOfEntryPoint;
         uint32_t program_entry = pe->peHeader.nt.OptionalHeader.ImageBase + pe->peHeader.nt.OptionalHeader.AddressOfEntryPoint;
         uint32_t param;
         main_thread->eip = dll_entry;
@@ -734,7 +906,7 @@ int emu_init()
         main_thread->ebp = 0;
         main_thread->restore_regs(uc);
 
-        curr_module_handle = pe->peHeader.nt.OptionalHeader.ImageBase; // TIL
+        curr_module_handle = pe->peHeader.nt.OptionalHeader.ImageBase;
 
         uc_assert(uc_mem_map_ptr(uc, stack_base, stack_size, UC_PROT_READ | UC_PROT_WRITE, main_thread->stack), "Failed to map stack");
         uc_assert(uc_mem_map_ptr(uc, seg_base, 0x2000, UC_PROT_READ | UC_PROT_WRITE, main_thread->teb), "Failed to map TEB");
@@ -803,9 +975,6 @@ int emu_init()
         uc_assert(uc_hook_add(uc, &interrupt, UC_HOOK_INTR, (void *)hook_interrupt, main_thread, 1, 0), "Failed to register interrupt hook");
         // uc_assert(uc_hook_add(uc, &trace, UC_HOOK_CODE, (void *)hook_trace, main_thread, 0x400000, 0x600000), "Failed to register trace hook");
         // printf("%s\n", export_log.c_str());
-
-        static uint16_t intMode = 0x101;
-        uc_assert(uc_mem_write(uc, 0x4c2747, &intMode, 2));
     }
     catch (std::exception &e)
     {

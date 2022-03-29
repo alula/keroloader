@@ -1729,6 +1729,20 @@ static void cb_kernel32_FlsGetValue(uc_engine *uc, uint32_t esp)
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
+static void cb_kernel32_GetProcessHeap(uc_engine *uc, uint32_t esp)
+{
+    uint32_t return_addr;
+    uint32_t ret = 1;
+    uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+
+    ret = curr_heap_handle;
+
+    esp += 4;
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EAX, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
+}
+
 static void cb_kernel32_HeapCreate(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
@@ -2390,22 +2404,6 @@ static void cb_kernel32_Sleep(uc_engine *uc, uint32_t esp)
 
     // usleep(time * 1000);
 
-    static bool is_pinkhour_143 = false;
-    if (is_pinkhour_143)
-    {
-        uint32_t shit;
-        uc_assert(uc_mem_read(uc, 0x527a18, &shit, 4));
-        printf("music shit: %#010x\n", shit);
-        if (shit != 0)
-        {
-            char t = 1;
-            uc_assert(uc_mem_write(uc, shit + 0, &t, 1));
-            t = 0;
-            uc_assert(uc_mem_write(uc, shit + 1, &t, 1));
-            uc_assert(uc_mem_write(uc, shit + 2, &t, 1));
-        }
-    }
-
     // logf("%#010x Sleep(%d)\n", return_addr, time);
     uc_emu_stop(uc);
     emu_sleep = get_ticks() + time;
@@ -2755,7 +2753,7 @@ void install_kernel32_exports(uc_engine *uc)
         uc_assert(uc_mem_write(uc, kern32_env_base, env, sizeof(kernel32_env_t)));
 
         auto heap_end = (void *)((char *)heap + heap_size);
-        tinyalloc::ta_init(&allocator, heap, heap_end, 1024 * 32, 16, 4);
+        tinyalloc::ta_init(&allocator, heap, heap_end, 1024 * 128, 16, 4);
 
         delete env;
     }
@@ -2908,6 +2906,9 @@ void install_kernel32_exports(uc_engine *uc)
 
     Export FlsGetValue_ex = {"FlsGetValue", cb_kernel32_FlsGetValue};
     exports["FlsGetValue"] = FlsGetValue_ex;
+
+    Export GetProcessHeap_ex = {"GetProcessHeap", cb_kernel32_GetProcessHeap};
+    exports["GetProcessHeap"] = GetProcessHeap_ex;
 
     Export HeapCreate_ex = {"HeapCreate", cb_kernel32_HeapCreate};
     exports["HeapCreate"] = HeapCreate_ex;

@@ -286,6 +286,7 @@ struct d3d9_mem
 
 constexpr uint32_t d3d9_mem_base = 0xf0200000;
 static d3d9_mem mem;
+float render_x_offset = 0.0;
 
 static void cb_dinput8_IDirectInput8W_EnumDevices(uc_engine *uc, uint32_t esp)
 {
@@ -419,7 +420,7 @@ static void cb_d3d9_IDirect3DDevice9_BeginScene(uc_engine *uc, uint32_t esp)
     {
         sgl_initialized = true;
         float width = sapp_widthf() / sapp_heightf() * 320.0f;
-        sgl_ortho(0.0, width, 320.0f, 0.0, -1000.0, 1000.0);
+        sgl_ortho(0.0 - render_x_offset, width - render_x_offset, 320.0f, 0.0, -1000.0, 1000.0);
     }
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
@@ -592,9 +593,10 @@ static void cb_d3d9_IDirect3D9Texture_Release(uc_engine *uc, uint32_t esp)
     auto tex = reinterpret_cast<D3DTexture *>(uintptr_t(&mem) + uintptr_t(self) - uintptr_t(d3d9_mem_base));
     if (self != 0 && tex->used)
     {
+        logf("texture release\n");
         tex->used = false;
-        //sg_destroy_image(tex->vtable.image);
-        tex->vtable.image.id = 0;
+        sg_destroy_image(tex->vtable.image);
+        tex->vtable.image.id = SG_INVALID_ID;
 
         if (tex->vtable.hostbuf != nullptr)
         {
@@ -842,6 +844,7 @@ static void cb_d3d9_D3DXCreateTexture(uc_engine *uc, uint32_t esp)
                 .mag_filter = SG_FILTER_NEAREST,
             };
 
+            printf("alloc texture: %d %d %d\n", i, width, height);
             uintptr_t bufaddr;
             uint32_t bufsize = width * height * 4;
             tex.used = true;
@@ -849,7 +852,7 @@ static void cb_d3d9_D3DXCreateTexture(uc_engine *uc, uint32_t esp)
             tex.vtable.buf = bufaddr;
             tex.vtable.bufsize = bufsize;
 
-            memset(tex.vtable.hostbuf, 0xff, bufsize);
+            // memset(tex.vtable.hostbuf, 0xff, bufsize);
             // img_desc.data.subimage[0][0].ptr = tex.vtable.hostbuf;
             // img_desc.data.subimage[0][0].size = bufsize;
 
@@ -868,8 +871,10 @@ static void cb_d3d9_D3DXCreateTexture(uc_engine *uc, uint32_t esp)
             break;
         }
 
-        if (!tex_found)
+        if (!tex_found) {
+            logf("out of texture memory space!\n");
             ret = D3DERR_OUTOFVIDEOMEMORY;
+        }
     }
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -934,31 +939,15 @@ void ID3D9XSpriteVtable::Init(uc_engine *uc)
     Draw = add_syscall(uc, thunk_cbs.size(), cb_d3d9_ID3DXSprite9_Draw);
 }
 
-void test_draw()
+void graphics_cleanup()
 {
-    /*sgl_defaults();
-    sgl_load_pipeline(state.deflt.pip);
-
-    sgl_enable_texture();
-    sgl_ortho(0.0, 800.0, 480.0, 0.0, -300.0, 300.0);
-
-    for (int i = 0; i < texture_count; i++)
-    {
-        if (mem.textures[i].used)
-        {
-            sgl_texture(mem.textures[i].vtable.image);
-
-            sgl_begin_quads();
-            sgl_c3b(255, 255, 255);
-            sgl_v3f_t2f(0.0f, 1.0f, 0.0f, 0.0f, 1.0f);
-            sgl_v3f_t2f(1.0f, 1.0f, 0.0f, 1.0f, 1.0f);
-            sgl_v3f_t2f(1.0f, 0.0f, 0.0f, 1.0f, 0.0f);
-            sgl_v3f_t2f(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-            sgl_end();
+    for (int i = 0; i < texture_count; i++) {
+        if (!mem.textures[i].used && mem.textures[i].vtable.image.id != SG_INVALID_ID) {
+            logf("destroyed texture %d (%d)\n", i, mem.textures);
+            sg_destroy_image(mem.textures[i].vtable.image);
+            mem.textures[i].vtable.image.id = SG_INVALID_ID;
         }
     }
-
-    sgl_draw();*/
 }
 
 void install_d3d9_exports(uc_engine *uc)

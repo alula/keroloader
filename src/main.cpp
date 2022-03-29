@@ -19,6 +19,7 @@ sokol_state state;
 extern void emu_loop();
 extern int emu_init();
 extern void logf(const char *fmt, ...);
+extern void dsound_stream_cb(float *buffer, int num_frames, int num_channels);
 
 int window_width = 0;
 int window_height = 0;
@@ -30,12 +31,17 @@ void init(void)
     sg_desc desc = {};
     sgl_desc_t sgl_desc = {};
     simgui_desc_t simgui_desc = {};
+    saudio_desc saudio_desc = {};
 
     desc.context = sapp_sgcontext();
+    saudio_desc.sample_rate = 44100;
+    saudio_desc.num_channels = 2;
+    saudio_desc.stream_cb = dsound_stream_cb;
+    
     sg_setup(&desc);
     sgl_setup(&sgl_desc);
     stm_setup();
-
+    saudio_setup(&saudio_desc);
     simgui_setup(&simgui_desc);
 
     pass_action.colors[0].action = SG_ACTION_CLEAR;
@@ -63,24 +69,8 @@ void init(void)
     chdir(activity->internalDataPath);
     logf("path: %s\n", activity->internalDataPath);
 #endif
-    bool steam_api_checksum_matches = true;
 
     strcpy(msgbox_title_txt, "KeroLoader2 initialization error");
-
-    if (std::filesystem::exists("./steam_api.cdx") || std::filesystem::exists("./steam_emu.ini") || !steam_api_checksum_matches) {
-        strcpy(msgbox_message_txt, "Cracked version detected. Please use a legit copy of the game copied from your Steam installation.");
-        return;
-    }
-
-    if (!std::filesystem::exists("./KeroBlaster.exe")) {
-        strcpy(msgbox_message_txt, "KeroBlaster.exe is missing or incompatible. Please copy files from latest Steam release in order to play.");
-        return;
-    }
-
-    if (!std::filesystem::exists("./msvcrt.dll")) {
-        strcpy(msgbox_message_txt, "msvcrt.dll is missing. Grab a 32-bit version somewhere from internet or from SysWoW64 folder from your Windows installation.");
-        return;
-    }
 
     int code = emu_init();
     if (code != 0)
@@ -89,17 +79,20 @@ void init(void)
     }
 }
 
-extern void test_draw();
+extern void graphics_cleanup();
 extern uint32_t get_ticks();
 
 extern uint32_t emu_sleep;
 extern bool emu_nointerrupt;
+extern float render_x_offset;
+float memex = 0, memey = 0;
 
 void frame(void)
 {
     const int width = sapp_width();
     const int height = sapp_height();
     const double delta_time = stm_sec(stm_laptime(&last_time));
+    render_x_offset = ((sapp_widthf() / sapp_heightf() * 320.0f) - 570.0f) / 2.0f;
 
     if (emu_sleep != 0)
     {
@@ -112,8 +105,6 @@ void frame(void)
 
     sgl_defaults();
     sgl_load_pipeline(state.deflt.pip);
-
-    sgl_draw();
 
     if (msgbox_message_txt[0])
     {
@@ -133,24 +124,41 @@ void frame(void)
         }
 
         ImGui::End();
-    } else {
+    }
+    else
+    {
         emu_loop();
         emu_nointerrupt = true;
     }
 
+    // sgl_disable_texture();
+    // sgl_begin_quads();
+    // sgl_c1i(0xff0000ff);
+    // sgl_v2f(memex - 3.0f, memey - 3.0f);
+    // sgl_v2f(memex + 3.0f, memey - 3.0f);
+    // sgl_v2f(memex + 3.0f, memey + 3.0f);
+    // sgl_v2f(memex - 3.0f, memey + 3.0f);
+    // sgl_end();
+
+    sgl_draw();
     simgui_render();
     sg_end_pass();
     sg_commit();
+
+    graphics_cleanup();
 }
 
 void cleanup(void)
 {
     simgui_shutdown();
+    sgl_shutdown();
     sg_shutdown();
+    saudio_shutdown();
 }
 
 static int to_vk(sapp_keycode code)
 {
+    // todo: add all windows virtual keycodes
     switch (code)
     {
     case SAPP_KEYCODE_ESCAPE:
@@ -202,8 +210,9 @@ void input(const sapp_event *event)
         {
             if (event->touches[i].changed)
             {
-                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f;
+                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f - render_x_offset;
                 float touch_y = event->touches[i].pos_y / sapp_heightf() * 320.0f;
+                // memex = touch_x; memey = touch_y;
                 push_touch(0, touch_x, touch_y);
             }
         }
@@ -214,8 +223,9 @@ void input(const sapp_event *event)
         {
             if (event->touches[i].changed)
             {
-                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f;
+                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f - render_x_offset;
                 float touch_y = event->touches[i].pos_y / sapp_heightf() * 320.0f;
+                // memex = touch_x; memey = touch_y;
                 push_touch(1, touch_x, touch_y);
             }
         }
@@ -226,23 +236,30 @@ void input(const sapp_event *event)
         {
             if (event->touches[i].changed)
             {
-                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f;
+                float touch_x = event->touches[i].pos_x / sapp_heightf() * 320.0f - render_x_offset;
                 float touch_y = event->touches[i].pos_y / sapp_heightf() * 320.0f;
+                // memex = touch_x; memey = touch_y;
                 push_touch(2, touch_x, touch_y);
             }
         }
     }
     else if (event->type == SAPP_EVENTTYPE_MOUSE_DOWN)
     {
-        push_touch(0, event->mouse_x, event->mouse_y);
+        float touch_x = event->mouse_x / sapp_heightf() * 320.0f - render_x_offset;
+        float touch_y = event->mouse_y / sapp_heightf() * 320.0f;
+        push_touch(0, touch_x, touch_y);
     }
     else if (event->type == SAPP_EVENTTYPE_MOUSE_MOVE)
     {
-        push_touch(1, event->mouse_x, event->mouse_y);
+        float touch_x = event->mouse_x / sapp_heightf() * 320.0f - render_x_offset;
+        float touch_y = event->mouse_y / sapp_heightf() * 320.0f;
+        push_touch(1, touch_x, touch_y);
     }
     else if (event->type == SAPP_EVENTTYPE_MOUSE_UP)
     {
-        push_touch(2, event->mouse_x, event->mouse_y);
+        float touch_x = event->mouse_x / sapp_heightf() * 320.0f - render_x_offset;
+        float touch_y = event->mouse_y / sapp_heightf() * 320.0f;
+        push_touch(2, touch_x, touch_y);
     }
 }
 

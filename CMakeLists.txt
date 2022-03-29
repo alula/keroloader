@@ -58,9 +58,9 @@ target_include_directories(keroloader2 PRIVATE
 target_link_directories(keroloader2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/unicorn")
 
 if (ANDROID)
-    target_link_libraries(keroloader2 "${CMAKE_CURRENT_SOURCE_DIR}/prebuilts/android/${ANDROID_ABI}/libunicorn.a" dl GLESv3 EGL android log)
+    target_link_libraries(keroloader2 "${CMAKE_CURRENT_SOURCE_DIR}/prebuilts/android/${ANDROID_ABI}/libunicorn.a" dl GLESv3 EGL OpenSLES android log)
 elseif (UNIX)
-    target_link_libraries(keroloader2 unicorn pthread GL X11 Xi Xcursor dl)
+    target_link_libraries(keroloader2 unicorn pthread GL X11 Xi Xcursor dl asound)
 endif ()
 
 #target_link_libraries(keroloader2 libunicorn.a)

@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <mutex>
 #include "common.h"
 #include "exports.h"
 
@@ -63,6 +64,9 @@ struct DSB
     IDirectSoundBuffer data;
     IDirectSoundBufferVtable vtbl;
     bool used = false;
+    bool playing = false;
+    bool looping = false;
+    float position = 0.0;
     uint32_t buf;
     uint32_t buf_size;
     void *hostbuf;
@@ -79,6 +83,7 @@ struct dsound_mem
 
 constexpr uint32_t dsound_mem_base = 0xf0400000;
 static dsound_mem mem;
+bool sound_initialized = false;
 
 static void cb_dsound_DirectSoundCreate(uc_engine *uc, uint32_t esp)
 {
@@ -127,6 +132,7 @@ static void cb_dsound_IDirectSound_CreateSoundBuffer(uc_engine *uc, uint32_t esp
             uc_assert(uc_mem_write(uc, dsb, &addr, 4));
             mem.sound_buffers[i].used = true;
             ret = 0;
+            break;
         }
     }
 
@@ -156,6 +162,7 @@ static void cb_dsound_IDirectSoundBuffer_Lock(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 28, &lp_buffer_size2, 4));
     esp += 36;
 
+    sound_initialized = true;
     auto dsb = reinterpret_cast<DSB *>(uintptr_t(&mem) + uintptr_t(self) - uintptr_t(dsound_mem_base));
     if (dsb->hostbuf != nullptr)
     {
@@ -183,7 +190,6 @@ static void cb_dsound_IDirectSoundBuffer_Lock(uc_engine *uc, uint32_t esp)
 
 static void cb_dsound_IDirectSoundBuffer_Unlock(uc_engine *uc, uint32_t esp)
 {
-    uint32_t dsb;
     uint32_t ret = 0;
     uint32_t return_addr;
 
@@ -197,11 +203,25 @@ static void cb_dsound_IDirectSoundBuffer_Unlock(uc_engine *uc, uint32_t esp)
 
 static void cb_dsound_IDirectSoundBuffer_Play(uc_engine *uc, uint32_t esp)
 {
-    uint32_t dsb;
+    uint32_t self;
+    uint32_t flags;
     uint32_t ret = 0;
     uint32_t return_addr;
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &self, 4));
+    uc_assert(uc_mem_read(uc, esp + 12, &flags, 4));
+
+    if (self != 0)
+    {
+        auto dsb = reinterpret_cast<DSB *>(uintptr_t(&mem) + uintptr_t(self) - uintptr_t(dsound_mem_base));
+        if (dsb->used)
+        {
+            dsb->playing = true;
+            if ((flags & 1) != 0)
+                dsb->looping = true;
+        }
+    }
     esp += 20;
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -211,7 +231,6 @@ static void cb_dsound_IDirectSoundBuffer_Play(uc_engine *uc, uint32_t esp)
 
 static void cb_dsound_IDirectSoundBuffer_Stop(uc_engine *uc, uint32_t esp)
 {
-    uint32_t dsb;
     uint32_t ret = 0;
     uint32_t return_addr;
 
@@ -225,11 +244,31 @@ static void cb_dsound_IDirectSoundBuffer_Stop(uc_engine *uc, uint32_t esp)
 
 static void cb_dsound_IDirectSoundBuffer_SetCurrentPosition(uc_engine *uc, uint32_t esp)
 {
-    uint32_t dsb;
+    uint32_t self;
+    uint32_t new_pos;
     uint32_t ret = 0;
     uint32_t return_addr;
 
     uc_assert(uc_mem_read(uc, esp, &return_addr, 4));
+    uc_assert(uc_mem_read(uc, esp + 4, &self, 4));
+    uc_assert(uc_mem_read(uc, esp + 8, &new_pos, 4));
+
+    if (self != 0)
+    {
+        auto dsb = reinterpret_cast<DSB *>(uintptr_t(&mem) + uintptr_t(self) - uintptr_t(dsound_mem_base));
+        if (dsb->used)
+        {
+            if (new_pos == 0)
+            {
+                dsb->position = 0;
+            }
+            else
+            {
+                dsb->position = new_pos * (44100.0f / 44100.0f);
+            }
+        }
+    }
+
     esp += 12;
 
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
@@ -290,10 +329,107 @@ void IDirectSoundBufferVtable::Init(uc_engine *uc)
     SetCurrentPosition = add_syscall(uc, thunk_cbs.size(), cb_dsound_IDirectSoundBuffer_SetCurrentPosition);
 }
 
+static std::mutex audioMutex;
+
+static int16_t audio_buf[44100];
+
+void dsound_stream_cb(float *buffer, int num_frames, int num_channels)
+{
+    int to_render = num_frames;
+    int index = 0;
+
+    bool lock = audioMutex.try_lock();
+    if (!lock)
+        return;
+
+    // if (pxtone_playing)
+    // {
+    //     if (pxtone.Moo(audio_buf, num_frames * 2 * sizeof(uint16_t)))
+    //     {
+    //         if (num_channels == 2)
+    //         {
+    //             for (int i = 0; i < num_frames * 2; i++)
+    //             {
+    //                 buffer[index++] = float(audio_buf[i]) / 32768.0f;
+    //             }
+    //         }
+    //         else
+    //         {
+    //             for (int i = 0; i < num_frames; i++)
+    //             {
+    //                 buffer[index++] = float(audio_buf[i * 2 + 1]) / 32768.0f;
+    //             }
+    //         }
+    //     }
+    // }
+    // else
+    {
+        for (int i = 0; i < num_frames * num_channels; i++)
+        {
+            buffer[i] = 0.0f;
+        }
+    }
+
+    constexpr float phase = 44100.0f / 44100.0f; // todo use sample rate info from dsound buffers
+    constexpr float s16tof = 1.0f / 32768.0f;
+
+    for (int idx = 0; idx < 512; idx++)
+    {
+        auto &buf = mem.sound_buffers[idx];
+        if (!buf.used || !buf.playing)
+            continue;
+
+        for (int i = 0; i < num_frames; i++)
+        {
+            int pos_int = (int)buf.position;
+            int length = buf.buf_size / 2;
+            if (pos_int > length)
+            {
+                if (buf.looping)
+                {
+                    buf.position = 0;
+                    pos_int = 0;
+                }
+                else
+                {
+                    buf.playing = false;
+                    break;
+                }
+            }
+
+            buf.position += phase;
+            if (num_channels == 2)
+            {
+                buffer[i * 2] += (((int16_t *)buf.hostbuf)[pos_int] ^ 0x0000) * s16tof;
+                buffer[i * 2 + 1] += (((int16_t *)buf.hostbuf)[pos_int] ^ 0x0000) * s16tof;
+            }
+            else
+            {
+                buffer[i] += (((int16_t *)buf.hostbuf)[pos_int] ^ 0x0000) * s16tof;
+            }
+        }
+    }
+
+    audioMutex.unlock();
+}
+
 void install_dsound_exports(uc_engine *uc)
 {
     uc_assert(uc_mem_map_ptr(uc, dsound_mem_base, align_address(sizeof(dsound_mem)), UC_PROT_READ | UC_PROT_WRITE, &mem));
     mem.Init(uc);
+    // pxtnERR pxtn_err = pxtnERR_VOID;
+    // pxtn_err = pxtone.init();
+    // if (pxtn_err == pxtnOK)
+    // {
+    //     pxtone_initialized = true;
+    //     pxtone.set_destination_quality(2, 44100);
+    // }
+    // else
+    // {
+    //     logf("Failed to initialize pxtone.\n");
+    // }
+
+    // pxtone_play_handler = add_syscall(uc, thunk_cbs.size(), cb_pxtone_playbgm);
 
     Export DirectSoundCreate_ex = {"DirectSoundCreate", cb_dsound_DirectSoundCreate};
     exports["DirectSoundCreate"] = DirectSoundCreate_ex;

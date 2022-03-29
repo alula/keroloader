@@ -9,6 +9,7 @@
 #include "sokol/sokol_glue.h"
 #include "sokol/sokol_imgui.h"
 #include "sokol/sokol_gl.h"
+#include "sokol/sokol_audio.h"
 
 struct sokol_state {
     struct {

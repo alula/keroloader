@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <ctime>
 #include "common.h"
@@ -32,6 +33,68 @@ static msvcrt_mem mem;
 
 static_assert(sizeof(time_t) == 8, "time_t is not 64-bit!");
 
+struct double_bits
+{
+    uint64_t signif : 52;
+    unsigned exp : 11;
+    unsigned sign : 1;
+};
+
+typedef struct
+{
+    uint64_t signif;
+    union
+    {
+        uint16_t signExp;
+        struct
+        {
+            unsigned int exp : 15;
+            unsigned int sign : 1;
+        } raw;
+    } x;
+} float80;
+
+constexpr float80 F80_NAN = {.signif = 0xc000000000000000, .x = {.raw = {.exp = 0x7fff, .sign = 0}}};
+constexpr float80 F80_INF = {.signif = 0x8000000000000000, .x = {.raw = {.exp = 0x7fff, .sign = 0}}};
+
+float80 f80_from_double(double d)
+{
+    struct double_bits db;
+    memcpy(&db, &d, sizeof(db));
+    float80 f;
+
+    if (db.exp == 0x7ff)
+        f.x.raw.exp = 0x7fff;
+    else if (db.exp == 0)
+        f.x.raw.exp = db.signif == 0 ? 0 : (1 - 0x3ff + 0x3fff);
+    else
+        f.x.raw.exp = ((int)db.exp - 0x3ff) + 0x3fff;
+
+    f.signif = db.signif << 11;
+    if (db.exp != 0)
+        f.signif |= (1ull << 63);
+    f.x.raw.sign = db.sign;
+
+    if (f.x.raw.exp == 0)
+        return f;
+    int shift = __builtin_clzl(f.signif);
+    if (f.signif == 0)
+        shift = 64;
+    if (f.x.raw.exp - shift < 1)
+    {
+        int shift = f.x.raw.exp - 1;
+        f.signif <<= shift;
+        f.x.raw.exp -= shift;
+        f.x.raw.exp = 0;
+        return f;
+    }
+
+    f.signif <<= shift;
+    f.x.raw.exp -= shift;
+    
+    return f;
+}
+
 static void cb_msvcrt_difftime64(uc_engine *uc, uint32_t esp)
 {
     uint32_t return_addr;
@@ -43,10 +106,12 @@ static void cb_msvcrt_difftime64(uc_engine *uc, uint32_t esp)
     uc_assert(uc_mem_read(uc, esp + 12, &time2, 8));
 
     ret = difftime(time1, time2);
+    printf("diff time: %ld %ld %f\n", time1, time2, ret);
+    float80 value = f80_from_double(ret);
 
     esp += 4;
     uc_assert(uc_reg_write(uc, UC_X86_REG_ESP, &esp));
-    uc_assert(uc_reg_write(uc, UC_X86_REG_ST0, &ret));
+    uc_assert(uc_reg_write(uc, UC_X86_REG_ST0, &value));
     uc_assert(uc_reg_write(uc, UC_X86_REG_EIP, &return_addr));
 }
 
